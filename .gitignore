@@ -57,3 +57,7 @@ coverage.xml
 
 # Impeccable cache
 .impeccable/
+
+# Screenshots & local config
+screenshots/
+pyproject.toml
