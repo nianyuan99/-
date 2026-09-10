@@ -53,7 +53,7 @@ import { useRouter } from 'vue-router'
 import { type MenuProps, message } from 'ant-design-vue'
 import { useLoginUserStore } from '@/stores/loginUser.ts'
 import { userLogout } from '@/api/user.ts'
-import { LogoutOutlined, HomeOutlined } from '@ant-design/icons-vue'
+import { LogoutOutlined, HomeOutlined, SwapOutlined } from '@ant-design/icons-vue'
 
 const loginUserStore = useLoginUserStore()
 const router = useRouter()
@@ -71,6 +71,12 @@ const originItems = [
     icon: () => h(HomeOutlined),
     label: '主页',
     title: '主页',
+  },
+  {
+    key: '/side-by-side',
+    icon: () => h(SwapOutlined),
+    label: '模型对比',
+    title: '模型对比',
   },
   {
     key: '/admin/userManage',

@@ -33,6 +33,13 @@ const router = createRouter({
       name: 'AI 对话',
       component: ChatPage,
     },
+    {
+      path: '/side-by-side',
+      name: 'SideBySidePage',
+      component: () => import('@/pages/SideBySidePage.vue'),
+      // fullscreen：该页自带左侧会话栏，隐藏全局顶部导航，占满整个视口
+      meta: { title: '模型对比', fullscreen: true },
+    },
   ],
 })
 
