@@ -7,9 +7,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, test, user
+from app.api import conversation, health, model, rating, test, user
 from app.core.config import get_settings
 from app.core.logging_config import LoggingConfig
+from app.core.scheduler import setup_scheduler, shutdown_scheduler
 from app.exceptions import BusinessException, business_exception_handler, global_exception_handler
 from app.middleware.session_middleware import RedisSessionMiddleware
 
@@ -46,6 +47,9 @@ app.add_exception_handler(Exception, global_exception_handler)
 app.include_router(health.router, prefix="/api")
 app.include_router(user.router, prefix="/api")
 app.include_router(test.router, prefix="/api")
+app.include_router(conversation.router, prefix="/api")
+app.include_router(rating.router, prefix="/api")
+app.include_router(model.router, prefix="/api")
 
 
 @app.get("/")
@@ -70,10 +74,14 @@ async def startup_event():
     logger.info("调试模式: %s", settings.APP_DEBUG)
     logger.info("=" * 50)
 
+    # 启动定时任务调度器（每天凌晨 2 点同步 OpenRouter 模型列表）
+    setup_scheduler()
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭事件"""
+    shutdown_scheduler()
     logger.info("AI 大模型评测平台关闭")
 
 
