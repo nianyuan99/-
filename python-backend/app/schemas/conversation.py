@@ -9,6 +9,7 @@
 from datetime import datetime
 from typing import List, Optional
 
+from app.constants import MAX_PROMPT_VARIANTS_COUNT, MIN_PROMPT_VARIANTS_COUNT
 from pydantic import BaseModel, Field
 
 
@@ -27,14 +28,61 @@ class SideBySideRequest(BaseModel):
     model_config = {"populate_by_name": True, "protected_namespaces": ()}
 
 
+class GenerateVariantsRequest(BaseModel):
+    """变体自动生成请求：传一个基础提示词，让大模型生成 N 个不同风格的变体"""
+
+    base_prompt: str = Field(
+        ..., min_length=1, max_length=2000, alias="basePrompt", description="基础提示词"
+    )
+    count: int = Field(
+        default=3,
+        ge=MIN_PROMPT_VARIANTS_COUNT,
+        le=MAX_PROMPT_VARIANTS_COUNT,
+        description=f"要生成的变体数量（{MIN_PROMPT_VARIANTS_COUNT}-{MAX_PROMPT_VARIANTS_COUNT}）",
+    )
+    model: Optional[str] = Field(
+        None,
+        description="生成用的模型；为空时用服务端默认免费模型。Prompt Lab 当前选中的模型可选传入",
+    )
+
+    model_config = {"populate_by_name": True, "protected_namespaces": ()}
+
+
+class PromptLabRequest(BaseModel):
+    """Prompt Lab 单模型多提示词对比请求"""
+
+    conversation_id: Optional[str] = Field(
+        None, alias="conversationId", description="对话ID，为空则新建对话"
+    )
+    model: str = Field(..., description="模型名称（只有一个，对比的是提示词而不是模型）")
+    prompt_variants: List[str] = Field(
+        ..., alias="promptVariants", description="提示词变体列表（2-5 个）"
+    )
+    variant_image_urls: Optional[List[List[str]]] = Field(
+        None, alias="variantImageUrls", description="每个变体对应的图片URL列表"
+    )
+    web_search_enabled: Optional[bool] = Field(
+        False, alias="webSearchEnabled", description="是否联网搜索"
+    )
+
+    model_config = {"populate_by_name": True, "protected_namespaces": ()}
+
+
 class RatingRequest(BaseModel):
     """用户评分请求"""
 
     conversation_id: str = Field(..., alias="conversationId", description="对话ID")
     message_index: int = Field(..., alias="messageIndex", ge=0, description="消息序号")
-    rating_type: str = Field(..., alias="ratingType", description="评分类型: model_better/tie/both_bad")
+    rating_type: str = Field(
+        ...,
+        alias="ratingType",
+        description="评分类型: model_better/tie/both_bad；Prompt Lab 为 variant_0、variant_1...",
+    )
     winner_model: Optional[str] = Field(None, alias="winnerModel", description="获胜模型")
     loser_model: Optional[str] = Field(None, alias="loserModel", description="失败模型")
+    winner_variant_index: Optional[int] = Field(
+        None, alias="winnerVariantIndex", ge=0, description="获胜变体索引（Prompt Lab 专用）"
+    )
 
     model_config = {"populate_by_name": True, "protected_namespaces": ()}
 
@@ -84,6 +132,9 @@ class ConversationMessageVO(BaseModel):
     id: str = Field(..., description="消息ID")
     conversation_id: str = Field(..., alias="conversationId", description="对话ID")
     message_index: int = Field(..., alias="messageIndex", description="消息序号")
+    variant_index: Optional[int] = Field(
+        None, alias="variantIndex", description="变体索引（Prompt Lab 专用）"
+    )
     role: str = Field(..., description="角色: user/assistant")
     model_name: Optional[str] = Field(None, alias="modelName", description="模型名称")
     content: str = Field(..., description="消息内容")
@@ -103,7 +154,14 @@ class RatingVO(BaseModel):
     id: str = Field(..., description="评分ID")
     conversation_id: str = Field(..., alias="conversationId", description="对话ID")
     message_index: int = Field(..., alias="messageIndex", description="消息序号")
-    rating_type: str = Field(..., alias="ratingType", description="评分类型")
+    rating_type: str = Field(
+        ...,
+        alias="ratingType",
+        description="评分类型: model_better/tie/both_bad；Prompt Lab 为 variant_0、variant_1...",
+    )
+    winner_variant_index: Optional[int] = Field(
+        None, alias="winnerVariantIndex", description="获胜变体索引（Prompt Lab 专用）"
+    )
     winner_model: Optional[str] = Field(None, alias="winnerModel", description="获胜模型")
     loser_model: Optional[str] = Field(None, alias="loserModel", description="失败模型")
 

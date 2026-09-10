@@ -16,6 +16,10 @@ class Rating(Base):
     用户在 Side-by-Side 对比后，对某一轮消息（messageIndex）给出评价：
     model_better（某个模型更好）/ tie（平局）/ both_bad（都不好）。
     同一用户对同一轮消息只保留一条评分，重复提交走更新逻辑。
+
+    Prompt Lab 模式下改为对提示词变体评分：
+    rating_type 存 variant_0 / variant_1 ...，winner_variant_index 记录获胜变体序号；
+    选「都不好」时仍是 both_bad。
     """
 
     __tablename__ = "rating"
@@ -25,7 +29,16 @@ class Rating(Base):
     message_index = Column("messageIndex", Integer, nullable=False, comment="消息序号")
     user_id = Column("userId", BigInteger, nullable=False, comment="用户ID")
     rating_type = Column(
-        "ratingType", String(20), nullable=False, comment="评分类型: model_better/tie/both_bad"
+        "ratingType",
+        String(20),
+        nullable=False,
+        comment="评分类型: model_better/tie/both_bad(Prompt Lab 为 variant_0、variant_1...)",
+    )
+    winner_variant_index = Column(
+        "winnerVariantIndex",
+        Integer,
+        nullable=True,
+        comment="获胜变体索引(Prompt Lab 专用，对应用户选中的提示词变体)",
     )
     winner_model = Column("winnerModel", String(100), nullable=True, comment="获胜模型")
     loser_model = Column("loserModel", String(100), nullable=True, comment="失败模型")

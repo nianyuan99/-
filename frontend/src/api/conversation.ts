@@ -42,6 +42,8 @@ export interface ConversationMessageVO {
   id: string
   conversationId: string
   messageIndex: number
+  /** 变体索引（Prompt Lab 专用；Side-by-Side 消息为 null） */
+  variantIndex?: number
   role: string
   modelName?: string
   content: string
@@ -59,12 +61,22 @@ export interface ConversationQueryRequest {
   pageSize?: number
 }
 
+/**
+ * 评分类型
+ *
+ * Side-by-Side 用 model_better / tie / both_bad；
+ * Prompt Lab 对变体评分，用 variant_0、variant_1 ...
+ */
+export type RatingType = 'model_better' | 'tie' | 'both_bad' | `variant_${number}`
+
 export interface RatingRequest {
   conversationId: string
   messageIndex: number
-  ratingType: 'model_better' | 'tie' | 'both_bad'
+  ratingType: RatingType
   winnerModel?: string
   loserModel?: string
+  /** 获胜变体索引（Prompt Lab 专用） */
+  winnerVariantIndex?: number
 }
 
 /** 评分记录（用于加载历史会话时回填评分状态） */
@@ -72,9 +84,37 @@ export interface RatingVO {
   id: string
   conversationId: string
   messageIndex: number
-  ratingType: 'model_better' | 'tie' | 'both_bad'
+  ratingType: RatingType
   winnerModel?: string
   loserModel?: string
+  /** 获胜变体索引（Prompt Lab 专用） */
+  winnerVariantIndex?: number
+}
+
+/** Prompt Lab 单模型多提示词对比请求 */
+export interface PromptLabRequest {
+  conversationId?: string
+  model: string
+  promptVariants: string[]
+  variantImageUrls?: string[][]
+  webSearchEnabled?: boolean
+}
+
+/** 变体自动生成请求 */
+export interface GenerateVariantsRequest {
+  basePrompt: string
+  count: number
+  model?: string
+}
+
+/**
+ * 变体自动生成：传一个基础提示词，返回 N 个不同风格的变体
+ */
+export async function generateVariants(params: GenerateVariantsRequest) {
+  return myAxios.post<BaseResponse<string[]>>(
+    '/conversation/prompt-lab/generate-variants',
+    params,
+  )
 }
 
 /**

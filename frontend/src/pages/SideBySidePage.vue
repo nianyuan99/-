@@ -69,6 +69,7 @@
             :options="modeOptions"
             :disabled="isLoading"
             class="mode-select"
+            @change="onModeChange"
           />
         </div>
 
@@ -377,6 +378,9 @@ import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
 /** 页面模式：模型对比（两个模型 vs）/ 单模型 */
 type Mode = 'compare' | 'single'
 
+/** 模式下拉里的「提示词实验」不是本页模式，选中它代表跳转到 Prompt Lab 页面 */
+const PROMPT_LAB_MODE = 'prompt-lab'
+
 /** 距离底部多少像素内算「贴着底部」，此时新内容自动跟随滚动 */
 const AUTO_SCROLL_THRESHOLD = 80
 
@@ -425,7 +429,14 @@ const modelB = ref<string>()
 const modeOptions = [
   { value: 'compare', label: '模型对比' },
   { value: 'single', label: '单模型' },
+  { value: PROMPT_LAB_MODE, label: '提示词实验' },
 ]
+
+/** 选中「提示词实验」时跳转到 Prompt Lab 页面（本页模式只有对比 / 单模型） */
+const onModeChange = (value: string) => {
+  if (value !== PROMPT_LAB_MODE) return
+  router.push('/prompt-lab')
+}
 
 // ---------- 会话 ----------
 const messages = ref<ChatMessage[]>([])
@@ -603,11 +614,15 @@ const loadModels = async () => {
   }
 }
 
-/** 加载侧栏历史会话 */
+/** 加载侧栏历史会话（只取 side_by_side 类型，避免混入提示词实验的记录） */
 const loadConversations = async () => {
   historyLoading.value = true
   try {
-    const res = await listConversationVoByPage({ current: 1, pageSize: HISTORY_PAGE_SIZE })
+    const res = await listConversationVoByPage({
+      conversationType: 'side_by_side',
+      current: 1,
+      pageSize: HISTORY_PAGE_SIZE,
+    })
     if (res.data.code === 0) {
       conversations.value = res.data.data?.records || []
     }

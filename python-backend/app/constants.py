@@ -24,6 +24,10 @@ RATING_TYPE_TIE = "tie"
 RATING_TYPE_BOTH_BAD = "both_bad"
 RATING_TYPES = (RATING_TYPE_MODEL_BETTER, RATING_TYPE_TIE, RATING_TYPE_BOTH_BAD)
 
+# Prompt Lab 的变体评分类型前缀：variant_0、variant_1 ...
+# 不走 RATING_TYPES 白名单，由 rating_service 按前缀 + 数字单独校验
+RATING_TYPE_VARIANT_PREFIX = "variant_"
+
 # 国内模型提供商关键字（用于同步时标记 isChina）
 CHINA_MODEL_PROVIDERS = [
     "qwen",
@@ -71,6 +75,10 @@ RECOMMENDED_MODEL_IDS = [
 
 # Side-by-Side 并发约束
 SIDE_BY_SIDE_MAX_MODELS = 8
+
+# Prompt Lab 变体数量约束（教程：2-5 个）
+MIN_PROMPT_VARIANTS_COUNT = 2
+MAX_PROMPT_VARIANTS_COUNT = 5
 
 # 流式响应超时（秒）
 STREAM_SINGLE_CHUNK_TIMEOUT = 30

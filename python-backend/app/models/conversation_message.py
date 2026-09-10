@@ -16,6 +16,9 @@ class ConversationMessage(Base):
 
     多模型对比模式下，同一轮对话会存在多条 message_index 相同的记录，
     通过 model_name 区分是哪个模型的回复。
+
+    Prompt Lab 模式下，同一轮的多个提示词变体也共享同一个 message_index，
+    改由 variant_index 区分是哪个变体（Side-by-Side 消息该列为 NULL）。
     """
 
     __tablename__ = "conversation_message"
@@ -24,6 +27,12 @@ class ConversationMessage(Base):
     conversation_id = Column("conversationId", String(36), nullable=False, comment="对话ID")
     user_id = Column("userId", BigInteger, nullable=False, comment="用户ID")
     message_index = Column("messageIndex", Integer, nullable=False, comment="消息序号(从0开始)")
+    variant_index = Column(
+        "variantIndex",
+        Integer,
+        nullable=True,
+        comment="变体索引(Prompt Lab 专用；同一轮的多个变体共享 messageIndex，靠它区分)",
+    )
     role = Column(String(20), nullable=False, comment="角色: user/assistant")
     model_name = Column("modelName", String(100), nullable=True, comment="模型名称(assistant消息)")
     content = Column(Text, nullable=False, comment="消息内容")

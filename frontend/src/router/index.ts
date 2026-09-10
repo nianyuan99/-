@@ -40,6 +40,13 @@ const router = createRouter({
       // fullscreen：该页自带左侧会话栏，隐藏全局顶部导航，占满整个视口
       meta: { title: '模型对比', fullscreen: true },
     },
+    {
+      path: '/prompt-lab',
+      name: 'PromptLabPage',
+      component: () => import('@/pages/PromptLabPage.vue'),
+      // 与模型对比页同构：自带左侧会话栏，隐藏全局顶部导航
+      meta: { title: '提示词实验', fullscreen: true },
+    },
   ],
 })
 

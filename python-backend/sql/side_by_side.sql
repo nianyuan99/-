@@ -29,6 +29,7 @@ create table if not exists conversation_message
     conversationId  varchar(36)                        not null comment '对话ID',
     userId          bigint                             not null comment '用户ID',
     messageIndex    int                                not null comment '消息序号(从0开始)',
+    variantIndex    int                                null comment '变体索引(Prompt Lab 专用；同一轮的多个变体共享 messageIndex，靠它区分)',
     role            varchar(20)                        not null comment '角色: user/assistant',
     modelName       varchar(100)                       null comment '模型名称(assistant消息)',
     content         text                               not null comment '消息内容',
@@ -78,7 +79,8 @@ create table if not exists rating
     conversationId  varchar(36)                        not null comment '对话ID',
     messageIndex    int                                not null comment '消息序号',
     userId          bigint                             not null comment '用户ID',
-    ratingType      varchar(20)                        not null comment '评分类型: model_better/tie/both_bad',
+    ratingType      varchar(20)                        not null comment '评分类型: model_better/tie/both_bad(Prompt Lab 为 variant_0、variant_1...)',
+    winnerVariantIndex int                             null comment '获胜变体索引(Prompt Lab 专用，对应用户选中的提示词变体)',
     winnerModel     varchar(100)                       null comment '获胜模型',
     loserModel      varchar(100)                       null comment '失败模型',
     createTime      datetime default CURRENT_TIMESTAMP not null comment '创建时间',
@@ -86,3 +88,25 @@ create table if not exists rating
     isDelete        tinyint  default 0                 not null comment '逻辑删除',
     unique key uk_conversation_message_user (conversationId, messageIndex, userId, isDelete)
 ) comment '用户评分表' collate = utf8mb4_unicode_ci;
+
+
+-- =============================================================================
+-- 存量库升级脚本（Prompt Lab 需要，但原建表语句里没有的两列）
+--
+-- 注意：只对「已经按老结构建好表」的库执行一次。
+-- 上面的 create table 语句已包含这两列，新建的库不需要再跑这一段。
+-- MySQL 8.0 的 add column 不支持 if not exists，重复执行会报
+-- ERROR 1060 (42S21): Duplicate column name，忽略即可。
+-- =============================================================================
+
+alter table conversation_message
+    add column variantIndex int null comment '变体索引(Prompt Lab 专用；同一轮的多个变体共享 messageIndex，靠它区分)'
+        after messageIndex;
+
+alter table rating
+    add column winnerVariantIndex int null comment '获胜变体索引(Prompt Lab 专用，对应用户选中的提示词变体)'
+        after ratingType;
+
+alter table rating
+    modify column ratingType varchar(20) not null
+        comment '评分类型: model_better/tie/both_bad(Prompt Lab 为 variant_0、variant_1...)';

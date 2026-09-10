@@ -34,6 +34,7 @@ async def add_rating(
         rating_type=rating_request.rating_type,
         winner_model=rating_request.winner_model,
         loser_model=rating_request.loser_model,
+        winner_variant_index=rating_request.winner_variant_index,
     )
     return BaseResponse(code=0, data=result, message="ok")
 

@@ -13,13 +13,16 @@ import uuid
 from decimal import Decimal
 from typing import AsyncGenerator, List, Optional, Tuple
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants import (
+    CONVERSATION_TYPE_PROMPT_LAB,
     CONVERSATION_TYPE_SIDE_BY_SIDE,
+    MAX_PROMPT_VARIANTS_COUNT,
     MESSAGE_ROLE_ASSISTANT,
     MESSAGE_ROLE_USER,
+    MIN_PROMPT_VARIANTS_COUNT,
     SIDE_BY_SIDE_MAX_MODELS,
     STREAM_MERGE_TIMEOUT,
     STREAM_SINGLE_CHUNK_TIMEOUT,
@@ -34,10 +37,13 @@ from app.models.model import Model
 from app.schemas.conversation import (
     ConversationMessageVO,
     ConversationVO,
+    GenerateVariantsRequest,
+    PromptLabRequest,
     SideBySideRequest,
     StreamChunkVO,
 )
 from app.utils.cost_calculator import CostCalculator
+from app.utils.prompt_security import validate_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,9 @@ TITLE_MAX_LENGTH = 30
 
 # 历史消息最多带回的轮数，避免上下文无限膨胀
 HISTORY_MAX_MESSAGES = 20
+
+# 变体自动生成默认使用的模型（OpenRouter 账号没钱，跑在免费模型上）
+GENERATE_VARIANTS_DEFAULT_MODEL = "nex-agi/nex-n2.5-mini:free"
 
 # 持有「取消后补写中断内容」的后台任务强引用。
 # asyncio 官方提示：只 create_task 而不保留引用，任务可能被垃圾回收导致写库丢失。
@@ -141,6 +150,9 @@ class ConversationService:
         assistant_message_index = user_message_index + 1
 
         # ========== 4. 为每个模型创建独立的流 ==========
+        # 传给 _stream_single_model 的 message_index 是「本轮 AI 回复」序号，
+        # 真正给模型拼上下文时取的是 < 本轮 user_index 的历史（见 _load_history_messages），
+        # 避免本轮刚保存的 user 消息被发两遍。
         tasks = [
             self._stream_single_model(
                 conversation_id=conversation_id,
@@ -148,6 +160,7 @@ class ConversationService:
                 model_name=model_name,
                 prompt=prompt,
                 message_index=assistant_message_index,
+                user_message_index=user_message_index,
                 variant_index=None,
                 image_urls=request.image_urls,
                 web_search_enabled=bool(request.web_search_enabled),
@@ -159,6 +172,203 @@ class ConversationService:
         async for event in self._merge_streams(tasks, request.models, conversation_id):
             yield event
 
+    # ============ 对外方法：Prompt Lab 流式对比 ============
+
+    async def prompt_lab_stream(
+        self, request: PromptLabRequest, user_id: int
+    ) -> AsyncGenerator[str, None]:
+        """
+        Prompt Lab 单模型多提示词对比（SSE 流式响应）
+
+        与 Side-by-Side 的区别：那边是「同一个提示词 + 多个模型」，这边是
+        「同一个模型 + 多个提示词变体」。多个变体共享同一个 messageIndex，
+        靠 variantIndex 区分，因此同一轮实验在库里是一组可归组的记录。
+
+        Args:
+            request: Prompt Lab 请求
+            user_id: 当前登录用户ID
+
+        Yields:
+            SSE 格式的字符串（data: {json}\n\n）
+        """
+        # ========== 1. 参数校验 ==========
+        self._validate_prompt_lab_request(request)
+
+        prompt_variants = request.prompt_variants
+        image_urls_list = request.variant_image_urls or []
+
+        # ========== 2. 创建或获取对话记录 ==========
+        # 与 side_by_side_stream 同理：流式开始后主请求的 db session 可能已被回收，
+        # 这里统一使用独立的 AsyncSessionLocal。
+        conversation_id = request.conversation_id
+        async with AsyncSessionLocal() as independent_db:
+            if conversation_id:
+                result = await independent_db.execute(
+                    select(Conversation).where(
+                        Conversation.id == conversation_id,
+                        Conversation.user_id == user_id,
+                        Conversation.is_delete == 0,
+                    )
+                )
+                if not result.scalar_one_or_none():
+                    raise BusinessException(ErrorCode.NOT_FOUND_ERROR, "对话不存在")
+            else:
+                conversation_id = str(uuid.uuid4())
+                independent_db.add(
+                    Conversation(
+                        id=conversation_id,
+                        user_id=user_id,
+                        title=self._generate_title(prompt_variants[0]),
+                        conversation_type=CONVERSATION_TYPE_PROMPT_LAB,
+                        models=[request.model],
+                        code_preview_enabled=0,
+                        total_tokens=0,
+                        total_cost=Decimal("0"),
+                        is_delete=0,
+                    )
+                )
+
+            # ========== 3. 获取本轮消息索引（所有变体共用） ==========
+            user_message_index = await self._get_next_message_index(
+                independent_db, conversation_id
+            )
+            assistant_message_index = user_message_index + 1
+
+            # ========== 4. 逐个变体保存用户消息 ==========
+            for idx, variant in enumerate(prompt_variants):
+                variant_images = image_urls_list[idx] if idx < len(image_urls_list) else None
+                await self._save_prompt_lab_user_message(
+                    independent_db,
+                    conversation_id,
+                    user_id,
+                    user_message_index,
+                    idx,
+                    variant,
+                    variant_images,
+                )
+
+            await independent_db.commit()
+
+        # ========== 5. 同一模型并行跑所有变体 ==========
+        tasks = [
+            self._stream_single_model(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_name=request.model,
+                prompt=variant,
+                message_index=assistant_message_index,
+                user_message_index=user_message_index,
+                variant_index=idx,
+                image_urls=image_urls_list[idx] if idx < len(image_urls_list) else None,
+                web_search_enabled=bool(request.web_search_enabled),
+            )
+            for idx, variant in enumerate(prompt_variants)
+        ]
+
+        # ========== 6. 合并所有变体的流并返回 ==========
+        model_names = [request.model] * len(prompt_variants)
+        async for event in self._merge_streams(tasks, model_names, conversation_id):
+            yield event
+
+    def _validate_prompt_lab_request(self, request: PromptLabRequest) -> None:
+        """
+        校验 Prompt Lab 请求参数
+
+        比 Side-by-Side 多一步 validate_prompt(v)：对每个提示词变体做安全审查，
+        单个变体不通过就整轮拒绝（避免「部分变体已经调用、部分被拦」的中间态）。
+        """
+        if not request.model or not request.model.strip():
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "模型不能为空")
+
+        if not request.prompt_variants:
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "提示词变体列表不能为空")
+
+        count = len(request.prompt_variants)
+        if count < MIN_PROMPT_VARIANTS_COUNT or count > MAX_PROMPT_VARIANTS_COUNT:
+            raise BusinessException(
+                ErrorCode.PARAMS_ERROR,
+                f"提示词变体数量必须在{MIN_PROMPT_VARIANTS_COUNT}-"
+                f"{MAX_PROMPT_VARIANTS_COUNT}个之间",
+            )
+
+        for variant in request.prompt_variants:
+            validate_prompt(variant)
+
+    # ============ 对外方法：变体自动生成 ============
+
+    async def generate_variants(self, request: GenerateVariantsRequest) -> List[str]:
+        """
+        根据基础提示词，让大模型生成 N 个不同风格的变体
+
+        实现要点：
+        1. 走 prompt_lab 流程之前，先校验基础提示词（避免拿一个含注入指令的输入去
+           调大模型生成更恶意的变体）。
+        2. 系统提示词强约束返回格式：一行一个变体，不要编号、不要解释、不要空行。
+           即便模型偶尔听话不好，也靠后处理裁剪到 count 条。
+        3. 默认用免费模型（OpenRouter 账号没余额），不阻塞用户。
+        """
+        base_prompt = request.base_prompt.strip()
+        if not base_prompt:
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "基础提示词不能为空")
+        # 安全校验：基础提示词本身也要过一遍黑名单
+        validate_prompt(base_prompt)
+
+        count = max(MIN_PROMPT_VARIANTS_COUNT, min(MAX_PROMPT_VARIANTS_COUNT, request.count))
+        model_name = (request.model or GENERATE_VARIANTS_DEFAULT_MODEL).strip()
+        if not model_name:
+            model_name = GENERATE_VARIANTS_DEFAULT_MODEL
+
+        system_prompt = (
+            "你是一名提示词优化助手。根据用户给出的「基础提示词」，"
+            f"生成{count}个不同风格的变体。变体类型可包括：直接提问、角色扮演、"
+            "思维链(CoT)、Few-shot 示例等。\n"
+            "严格要求：\n"
+            "1. 每个变体单独一行，行内不要带编号、不要带引号、不要加项目符号；\n"
+            "2. 变体之间用单个换行分隔，不要有空行；\n"
+            f"3. 只输出{count}个变体，不要任何解释、前言或结语。\n"
+        )
+
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": base_prompt},
+                ],
+                temperature=0.8,
+                extra_headers=OPENROUTER_EXTRA_HEADERS,
+            )
+        except Exception as e:
+            logger.exception("生成变体失败 model=%s: %s", model_name, e)
+            raise BusinessException(
+                ErrorCode.SYSTEM_ERROR, f"生成变体失败：{type(e).__name__}"
+            ) from e
+
+        content = (response.choices[0].message.content or "").strip() if response.choices else ""
+        if not content:
+            raise BusinessException(ErrorCode.SYSTEM_ERROR, "生成结果为空，请稍后重试")
+
+        # 拆行 + 清洗：去掉 "1." "1、" "- " "* " 等常见编号/项目符号前缀
+        import re
+        prefix_re = re.compile(r"^(\d+[\.\u3001\)]?\s+|[\-\*\u2022]\s+)")
+        lines: List[str] = []
+        for raw in content.splitlines():
+            text = prefix_re.sub("", raw.strip()).strip()
+            if text:
+                lines.append(text)
+
+        if not lines:
+            raise BusinessException(
+                ErrorCode.SYSTEM_ERROR, "生成结果无法解析，请稍后重试"
+            )
+
+        # 截到 count 条 + 用空行填充（极端情况下模型生成的数量不足）
+        variants = lines[:count]
+        if len(variants) < count:
+            variants += [base_prompt] * (count - len(variants))
+
+        return variants
+
     async def _stream_single_model(
         self,
         conversation_id: str,
@@ -166,10 +376,11 @@ class ConversationService:
         model_name: str,
         prompt: str,
         message_index: int,
-        variant_index: Optional[int],
-        image_urls: Optional[List[str]],
-        web_search_enabled: bool,
+        variant_index: Optional[int] = None,
+        image_urls: Optional[List[str]] = None,
+        web_search_enabled: bool = False,
         system_prompt: Optional[str] = None,
+        user_message_index: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
         """
         调用单个模型并流式返回结果
@@ -180,6 +391,8 @@ class ConversationService:
             model_name: 模型名称
             prompt: 本轮用户提问
             message_index: 本轮 AI 回复的消息序号
+            user_message_index: 本轮用户消息序号；传给 _load_history_messages 用于排除本轮 user 消息
+                （不传则回退到 message_index，与旧行为一致）
             variant_index: 变体索引（Prompt Lab 场景使用，Side-by-Side 传 None）
             image_urls: 图片URL列表
             web_search_enabled: 是否启用联网搜索
@@ -202,9 +415,17 @@ class ConversationService:
 
         try:
             # ========== 第二步：加载历史消息与模型价格 ==========
+            # 旧实现传 message_index（即 assistant_index），会让 < assistant_index 把本轮
+            # user 消息也取进来；后面再 append 一份 prompt，模型就会看到当前问题重复两遍。
+            # 改用 caller 传进来的 user_message_index（缺省回退到 message_index）。
             async with AsyncSessionLocal() as history_db:
+                history_before = (
+                    user_message_index
+                    if user_message_index is not None
+                    else message_index
+                )
                 history_messages = await self._load_history_messages(
-                    history_db, conversation_id, message_index
+                    history_db, conversation_id, history_before, variant_index
                 )
                 input_price, output_price = await self._load_model_prices(history_db, model_name)
 
@@ -265,6 +486,7 @@ class ConversationService:
                         reasoning_vo = StreamChunkVO(
                             conversation_id=conversation_id,
                             model_name=model_name,
+                            variant_index=variant_index,
                             message_index=message_index,
                             reasoning=accumulated_reasoning,
                             has_reasoning=True,
@@ -283,6 +505,7 @@ class ConversationService:
                     chunk_vo = StreamChunkVO(
                         conversation_id=conversation_id,
                         model_name=model_name,
+                        variant_index=variant_index,
                         message_index=message_index,
                         content=content,
                         full_content=accumulated_content,
@@ -320,6 +543,7 @@ class ConversationService:
             done_vo = StreamChunkVO(
                 conversation_id=conversation_id,
                 model_name=model_name,
+                variant_index=variant_index,
                 message_index=message_index,
                 full_content=accumulated_content,
                 input_tokens=input_tokens,
@@ -345,6 +569,7 @@ class ConversationService:
                 user_id=user_id,
                 message_index=message_index,
                 model_name=model_name,
+                variant_index=variant_index,
                 content=accumulated_content,
                 reasoning=accumulated_reasoning,
                 input_tokens=input_tokens,
@@ -360,6 +585,7 @@ class ConversationService:
             error_vo = StreamChunkVO(
                 conversation_id=conversation_id,
                 model_name=model_name,
+                variant_index=variant_index,
                 message_index=message_index,
                 error=f"{type(e).__name__}: {e}",
                 has_error=True,
@@ -523,13 +749,12 @@ class ConversationService:
 
     # ============ 内部方法：数据库操作 ============
 
-    async def _save_user_message(
-        self, db: AsyncSession, conversation_id: str, user_id: int, prompt: str
-    ) -> int:
+    async def _get_next_message_index(self, db: AsyncSession, conversation_id: str) -> int:
         """
-        保存用户消息，返回本轮消息序号
+        获取下一个可用的消息索引
 
-        序号在当前对话最大 messageIndex 基础上 +1，保证多轮对话顺序递增。
+        序号在当前对话最大 messageIndex 基础上 +1，保证多轮对话顺序递增；
+        空对话从 0 开始。Prompt Lab 的一轮实验里，所有变体共享这个索引。
         """
         result = await db.execute(
             select(func.max(ConversationMessage.message_index)).where(
@@ -538,7 +763,46 @@ class ConversationService:
             )
         )
         max_index = result.scalar()
-        user_message_index = (max_index + 1) if max_index is not None else 0
+        return (max_index + 1) if max_index is not None else 0
+
+    async def _save_prompt_lab_user_message(
+        self,
+        db: AsyncSession,
+        conversation_id: str,
+        user_id: int,
+        message_index: int,
+        variant_index: int,
+        content: str,
+        image_urls: Optional[List[str]] = None,
+    ) -> None:
+        """
+        保存 Prompt Lab 某个变体的用户消息
+
+        同一轮的每个变体都会独立存一条 user 记录，它们 message_index 相同、
+        variant_index 不同，这样加载历史时能按变体过滤出各自的上下文。
+        """
+        db.add(
+            ConversationMessage(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation_id,
+                user_id=user_id,
+                message_index=message_index,
+                variant_index=variant_index,
+                role=MESSAGE_ROLE_USER,
+                content=content,
+                is_delete=0,
+            )
+        )
+
+    async def _save_user_message(
+        self, db: AsyncSession, conversation_id: str, user_id: int, prompt: str
+    ) -> int:
+        """
+        保存用户消息，返回本轮消息序号
+
+        序号在当前对话最大 messageIndex 基础上 +1，保证多轮对话顺序递增。
+        """
+        user_message_index = await self._get_next_message_index(db, conversation_id)
 
         db.add(
             ConversationMessage(
@@ -571,7 +835,7 @@ class ConversationService:
         """
         保存 AI 回复，并累加对话/模型的消耗统计
 
-        variant_index 仅用于 Prompt Lab 场景定位变体，消息表没有对应列，因此不落库。
+        variant_index 落库供 Prompt Lab 还原变体分组；Side-by-Side 传 None。
         """
         db.add(
             ConversationMessage(
@@ -579,6 +843,7 @@ class ConversationService:
                 conversation_id=conversation_id,
                 user_id=user_id,
                 message_index=message_index,
+                variant_index=variant_index,
                 role=MESSAGE_ROLE_ASSISTANT,
                 model_name=model_name,
                 content=content,
@@ -617,6 +882,7 @@ class ConversationService:
         user_id: int,
         message_index: int,
         model_name: str,
+        variant_index: Optional[int],
         content: str,
         reasoning: str,
         input_tokens: int,
@@ -651,7 +917,7 @@ class ConversationService:
                     user_id,
                     message_index,
                     model_name,
-                    None,
+                    variant_index,
                     content,
                     input_tokens,
                     output_tokens,
@@ -677,26 +943,39 @@ class ConversationService:
             logger.exception("保存模型 %s 的中断内容失败", model_name)
 
     async def _load_history_messages(
-        self, db: AsyncSession, conversation_id: str, before_index: int
+        self,
+        db: AsyncSession,
+        conversation_id: str,
+        before_index: int,
+        variant_index: Optional[int] = None,
     ) -> List[Tuple[str, str]]:
         """
         加载本轮之前的历史消息，用于构建多轮上下文
 
         Args:
             before_index: 只取 messageIndex 小于该值的消息（即本轮用户消息之前的内容）
+            variant_index: Prompt Lab 场景传入当前变体序号，只取「本变体的消息 +
+                没有变体标识的公共消息」；Side-by-Side 传 None 表示不过滤。
+                带上 variant_index IS NULL 是为了兼容从 Side-by-Side 切过来的历史消息。
 
         Returns:
             [(role, content), ...]
         """
-        result = await db.execute(
-            select(ConversationMessage.role, ConversationMessage.content)
-            .where(
-                ConversationMessage.conversation_id == conversation_id,
-                ConversationMessage.message_index < before_index,
-                ConversationMessage.is_delete == 0,
-            )
-            .order_by(ConversationMessage.message_index.asc())
+        query = select(ConversationMessage.role, ConversationMessage.content).where(
+            ConversationMessage.conversation_id == conversation_id,
+            ConversationMessage.message_index < before_index,
+            ConversationMessage.is_delete == 0,
         )
+
+        if variant_index is not None:
+            query = query.where(
+                or_(
+                    ConversationMessage.variant_index == variant_index,
+                    ConversationMessage.variant_index.is_(None),
+                )
+            )
+
+        result = await db.execute(query.order_by(ConversationMessage.message_index.asc()))
         rows = result.all()
         # 只保留最近 N 条，避免上下文无限膨胀
         return [(row[0], row[1]) for row in rows[-HISTORY_MAX_MESSAGES:]]

@@ -3,17 +3,32 @@
 """
 
 import logging
+import re
 import uuid
 from typing import List, Optional
 
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.constants import RATING_TYPES
+from app.constants import RATING_TYPE_VARIANT_PREFIX, RATING_TYPES
 from app.exceptions import BusinessException, ErrorCode
 from app.models.rating import Rating
 
 logger = logging.getLogger(__name__)
+
+# Prompt Lab 的变体评分：rating_type 形如 variant_0 / variant_1 ...
+_VARIANT_RATING_PATTERN = re.compile(rf"^{RATING_TYPE_VARIANT_PREFIX}(\d+)$")
+
+
+def _is_valid_rating_type(rating_type: str) -> bool:
+    """Side-by-Side 走 RATING_TYPES 白名单，Prompt Lab 的 variant_N 按正则放行"""
+    return rating_type in RATING_TYPES or bool(_VARIANT_RATING_PATTERN.match(rating_type))
+
+
+def _parse_variant_index(rating_type: str) -> Optional[int]:
+    """从 variant_N 里解出变体序号，非变体评分返回 None"""
+    matched = _VARIANT_RATING_PATTERN.match(rating_type)
+    return int(matched.group(1)) if matched else None
 
 
 class RatingService:
@@ -30,6 +45,7 @@ class RatingService:
         rating_type: str,
         winner_model: Optional[str] = None,
         loser_model: Optional[str] = None,
+        winner_variant_index: Optional[int] = None,
     ) -> bool:
         """
         保存或更新评分（有则更新、无则新增）
@@ -41,17 +57,24 @@ class RatingService:
             conversation_id: 对话ID
             message_index: 消息序号
             user_id: 用户ID
-            rating_type: 评分类型: model_better/tie/both_bad
+            rating_type: 评分类型: model_better/tie/both_bad；Prompt Lab 为 variant_0、variant_1...
             winner_model: 获胜模型
             loser_model: 失败模型
+            winner_variant_index: 获胜变体索引（Prompt Lab 专用）
 
         Returns:
             是否保存成功
         """
         if not conversation_id:
             raise BusinessException(ErrorCode.PARAMS_ERROR, "对话ID不能为空")
-        if rating_type not in RATING_TYPES:
+        if not _is_valid_rating_type(rating_type):
             raise BusinessException(ErrorCode.PARAMS_ERROR, "评分类型不合法")
+
+        # rating_type 已经带了序号时以它为准，避免前端漏传 winnerVariantIndex
+        # 导致「评的是变体 2、库里记的是空」这种不一致数据
+        parsed_variant_index = _parse_variant_index(rating_type)
+        if parsed_variant_index is not None:
+            winner_variant_index = parsed_variant_index
 
         result = await self.db.execute(
             select(Rating).where(
@@ -69,6 +92,7 @@ class RatingService:
             existing_rating.rating_type = rating_type
             existing_rating.winner_model = winner_model
             existing_rating.loser_model = loser_model
+            existing_rating.winner_variant_index = winner_variant_index
         else:
             self.db.add(
                 Rating(
@@ -77,6 +101,7 @@ class RatingService:
                     message_index=message_index,
                     user_id=user_id,
                     rating_type=rating_type,
+                    winner_variant_index=winner_variant_index,
                     winner_model=winner_model,
                     loser_model=loser_model,
                     is_delete=0,

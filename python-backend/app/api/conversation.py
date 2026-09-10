@@ -16,6 +16,8 @@ from app.db.session import get_async_db
 from app.schemas.conversation import (
     ConversationMessageVO,
     ConversationQueryRequest,
+    GenerateVariantsRequest,
+    PromptLabRequest,
     SideBySideRequest,
 )
 from app.schemas.user import BaseResponse
@@ -93,6 +95,75 @@ async def side_by_side_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/prompt-lab/stream", summary="Prompt Lab单模型多提示词对比(流式)")
+async def prompt_lab_stream(
+    request_data: PromptLabRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Prompt Lab 单模型多提示词对比（SSE 流式响应）"""
+    # 限流检查：一次请求会并发调用同一个模型 N 次，成本比 Side-by-Side 更集中
+    await check_rate_limit(
+        _get_redis(http_request),
+        http_request,
+        RateLimitType.USER,
+        5,
+        60,
+        message="AI 对话请求过于频繁，请稍后再试",
+    )
+    login_user = await UserService.get_login_user(db, http_request)
+
+    conversation_service = ConversationService(db, _get_redis(http_request))
+
+    # 参数 / 安全校验必须放在建流之前：
+    # prompt_lab_stream 是异步生成器，里面的 BusinessException 要等到响应体开始推送才抛出，
+    # 那时 HTTP 头已经发出（200 + text/event-stream），异常没法再转成统一的 BaseResponse，
+    # 前端只能拿到一个空流（表现为「连接已中断」），看不到具体原因。
+    # 服务内部仍保留同一份校验，手动调用该服务时同样安全。
+    conversation_service._validate_prompt_lab_request(request_data)
+
+    return StreamingResponse(
+        _stream_with_disconnect_check(
+            conversation_service.prompt_lab_stream(request_data, login_user.id),
+            http_request,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/prompt-lab/generate-variants",
+    response_model=BaseResponse[list[str]],
+    summary="变体自动生成",
+)
+async def generate_prompt_variants(
+    request_data: GenerateVariantsRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """
+    变体自动生成：传一个基础提示词，返回 N 个不同风格的变体。
+    用于在 Prompt Lab 页面帮用户一键填充变体输入框。
+    """
+    await check_rate_limit(
+        _get_redis(http_request),
+        http_request,
+        RateLimitType.USER,
+        5,
+        60,
+        message="AI 对话请求过于频繁，请稍后再试",
+    )
+    login_user = await UserService.get_login_user(db, http_request)
+    conversation_service = ConversationService(db, _get_redis(http_request))
+    variants = await conversation_service.generate_variants(request_data)
+    return BaseResponse(code=0, data=variants, message="ok")
 
 
 @router.post(
