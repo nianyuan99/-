@@ -5,6 +5,12 @@
 from app.models.conversation import Conversation
 from app.models.conversation_message import ConversationMessage
 from app.models.model import Model
+from app.models.prompt_optimization_history import PromptOptimizationHistory
+from app.models.prompt_template import PromptTemplate
+from app.models.prompt_template_interaction import (
+    PromptTemplateFavorite,
+    PromptTemplateLike,
+)
 from app.models.rating import Rating
 from app.models.scene import Scene
 from app.models.scene_prompt import ScenePrompt
@@ -17,6 +23,10 @@ __all__ = [
     "Conversation",
     "ConversationMessage",
     "Model",
+    "PromptOptimizationHistory",
+    "PromptTemplate",
+    "PromptTemplateFavorite",
+    "PromptTemplateLike",
     "Rating",
     "Scene",
     "ScenePrompt",

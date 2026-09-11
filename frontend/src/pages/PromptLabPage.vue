@@ -335,6 +335,25 @@
               </a-tooltip>
               <a-button
                 size="small"
+                type="primary"
+                :disabled="isStreaming"
+                style="flex-shrink: 0"
+                @click="showTemplateLibrary"
+              >
+                <template #icon><AppstoreOutlined /></template>
+                模板库
+              </a-button>
+              <a-button
+                size="small"
+                :disabled="isStreaming"
+                style="flex-shrink: 0"
+                @click="showOptimizationHistory"
+              >
+                <template #icon><HistoryOutlined /></template>
+                优化历史
+              </a-button>
+              <a-button
+                size="small"
                 type="dashed"
                 :disabled="isStreaming || generating"
                 @click="openGenerateModal"
@@ -367,9 +386,22 @@
             <div v-for="(variant, vi) in variants" :key="vi" class="pl-variant-card">
               <div class="pl-variant-card-header">
                 <span class="pl-variant-label">变体 {{ vi + 1 }}</span>
-                <button class="pl-icon-btn" title="放大编辑" @click="expandVariant(vi)">
-                  <ExpandOutlined />
-                </button>
+                <div class="pl-variant-actions">
+                  <a-button
+                    size="small"
+                    type="link"
+                    :loading="optimizingIndex === vi"
+                    :disabled="!variants[vi] || variants[vi].trim() === '' || isStreaming"
+                    class="pl-optimize-btn"
+                    @click="handleOptimizePrompt(vi)"
+                  >
+                    <template #icon><ThunderboltOutlined /></template>
+                    优化
+                  </a-button>
+                  <button class="pl-icon-btn" title="放大编辑" @click="expandVariant(vi)">
+                    <ExpandOutlined />
+                  </button>
+                </div>
               </div>
               <textarea
                 v-model="variants[vi]"
@@ -469,6 +501,309 @@
         </div>
       </div>
     </a-modal>
+
+    <!-- 模板库抽屉 -->
+    <a-drawer
+      v-model:open="templateLibraryVisible"
+      title="提示词模板库"
+      width="720px"
+      placement="right"
+    >
+      <div class="template-library">
+        <!-- 模板来源分页签：全部 / 社区 / 我的收藏（功能扩展 2） -->
+        <a-tabs v-model:activeKey="templateTab" size="small" @change="onTemplateTabChange">
+          <a-tab-pane key="all" tab="全部模板" />
+          <a-tab-pane key="community" tab="社区分享" />
+          <a-tab-pane key="favorite" tab="我的收藏" />
+        </a-tabs>
+
+        <!-- 策略筛选 -->
+        <div class="strategy-filter">
+          <a-radio-group v-model:value="selectedStrategy" @change="loadTemplates">
+            <a-radio-button value="">全部</a-radio-button>
+            <a-radio-button value="direct">直接提问</a-radio-button>
+            <a-radio-button value="cot">CoT</a-radio-button>
+            <a-radio-button value="role_play">角色扮演</a-radio-button>
+            <a-radio-button value="few_shot">Few-shot</a-radio-button>
+          </a-radio-group>
+          <!-- 社区页签下提供排序切换 -->
+          <a-radio-group
+            v-if="templateTab === 'community'"
+            v-model:value="communitySortBy"
+            size="small"
+            @change="loadTemplates"
+          >
+            <a-radio-button value="latest">最新</a-radio-button>
+            <a-radio-button value="hot">最热</a-radio-button>
+          </a-radio-group>
+        </div>
+
+        <!-- 模板列表 -->
+        <div v-if="templates.length > 0" class="template-list">
+          <div v-for="template in templates" :key="template.id" class="template-item">
+            <div class="template-header" @click="selectTemplate(template)">
+              <div class="template-title-row">
+                <span class="template-name">{{ template.name }}</span>
+                <a-tag v-if="template.isPreset" color="blue">预设</a-tag>
+                <a-tag v-else color="green">自定义</a-tag>
+                <a-tag v-if="template.isPublic && !template.isPreset" color="cyan">公开</a-tag>
+              </div>
+              <a-tag color="purple">{{ template.strategyName }}</a-tag>
+            </div>
+            <div
+              v-if="template.description"
+              class="template-description"
+              @click="selectTemplate(template)"
+            >
+              {{ template.description }}
+            </div>
+            <div class="template-preview" @click="selectTemplate(template)">
+              {{ template.content?.substring(0, 100)
+              }}{{ template.content && template.content.length > 100 ? '...' : '' }}
+            </div>
+            <!-- 底部：使用次数 + 作者 + 点赞/收藏（功能扩展 2） -->
+            <div class="template-footer">
+              <div class="template-meta">
+                <span class="template-usage">使用 {{ template.usageCount || 0 }} 次</span>
+                <span v-if="template.authorName" class="template-author">
+                  来自 {{ template.authorName }}
+                </span>
+              </div>
+              <div class="template-interactions">
+                <button
+                  class="template-interact-btn"
+                  :class="{ active: template.liked }"
+                  :title="template.liked ? '取消点赞' : '点赞'"
+                  @click.stop="handleToggleLike(template)"
+                >
+                  <LikeFilled v-if="template.liked" />
+                  <LikeOutlined v-else />
+                  <span>{{ template.likeCount || 0 }}</span>
+                </button>
+                <button
+                  class="template-interact-btn"
+                  :class="{ active: template.favorited }"
+                  :title="template.favorited ? '取消收藏' : '收藏'"
+                  @click.stop="handleToggleFavorite(template)"
+                >
+                  <StarFilled v-if="template.favorited" />
+                  <StarOutlined v-else />
+                  <span>{{ template.favoriteCount || 0 }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <a-empty v-else :description="emptyTemplateHint" />
+
+        <!-- 创建模板按钮 -->
+        <div class="template-actions">
+          <a-button type="dashed" block @click="showCreateTemplateModal">
+            <template #icon><PlusOutlined /></template>
+            创建自定义模板
+          </a-button>
+        </div>
+      </div>
+    </a-drawer>
+
+    <!-- 模板变量填写（功能扩展 1：模板变量自动替换） -->
+    <a-modal
+      v-model:open="variableFormVisible"
+      title="填写模板变量"
+      ok-text="应用模板"
+      cancel-text="取消"
+      :confirm-loading="fillingVariables"
+      width="560px"
+      @ok="submitVariableForm"
+    >
+      <div class="variable-form">
+        <div class="variable-form-tip">
+          模板「{{ variableFormTemplate?.name }}」包含 {{ variableFormFields.length }} 个变量，填写后会自动替换到变体 {{ variableFormVariantIndex + 1 }}。
+        </div>
+        <div
+          v-for="field in variableFormFields"
+          :key="field.name"
+          class="variable-form-field"
+        >
+          <label>{{ field.name }}</label>
+          <a-textarea
+            v-model:value="field.value"
+            :rows="2"
+            :placeholder="`请输入 ${field.name} 的值`"
+          />
+        </div>
+      </div>
+    </a-modal>
+
+    <!-- 创建自定义模板 -->
+    <a-modal
+      v-model:open="createTemplateVisible"
+      title="创建自定义模板"
+      ok-text="创建并应用"
+      cancel-text="取消"
+      :confirm-loading="creatingTemplate"
+      width="620px"
+      @ok="submitCreateTemplate"
+    >
+      <div class="pl-generate-form">
+        <div class="pl-generate-field">
+          <label>模板名称</label>
+          <a-input v-model:value="createTemplateForm.name" placeholder="例如：代码审查助手" />
+        </div>
+        <div class="pl-generate-field">
+          <label>策略类型</label>
+          <a-select
+            v-model:value="createTemplateForm.strategy"
+            :options="strategyOptions"
+            style="width: 100%"
+          />
+        </div>
+        <div class="pl-generate-field">
+          <label>描述（可选）</label>
+          <a-input v-model:value="createTemplateForm.description" placeholder="这个模板用在什么场景" />
+        </div>
+        <div class="pl-generate-field">
+          <label>模板内容</label>
+          <a-textarea
+            v-model:value="createTemplateForm.content"
+            :rows="8"
+            placeholder="支持 {变量名} 占位符，例如：你是一位{role}，请回答：{question}"
+          />
+        </div>
+        <div class="pl-generate-field">
+          <label>分享到社区</label>
+          <a-switch v-model:checked="createTemplateForm.isPublic" />
+          <span class="pl-generate-hint">
+            开启后其他用户可以在「社区分享」里浏览和使用这个模板
+          </span>
+        </div>
+      </div>
+    </a-modal>
+
+    <!-- 优化结果抽屉 -->
+    <a-drawer
+      v-model:open="optimizationDrawerVisible"
+      title="提示词优化建议"
+      width="600px"
+      placement="right"
+    >
+      <div v-if="optimizationResult" class="optimization-result">
+        <!-- 质量评分（功能扩展 4） -->
+        <div v-if="optimizationResult.qualityScore != null" class="quality-score-card">
+          <div class="quality-score-left">
+            <div
+              class="quality-score-value"
+              :class="`quality-${optimizationResult.qualityLevel}`"
+            >
+              {{ optimizationResult.qualityScore }}
+            </div>
+            <div class="quality-score-unit">/ 100</div>
+          </div>
+          <div class="quality-score-right">
+            <div class="quality-score-title">
+              原始提示词质量
+              <a-tag :color="QUALITY_LEVEL_COLOR[optimizationResult.qualityLevel || 'fair']">
+                {{ QUALITY_LEVEL_TEXT[optimizationResult.qualityLevel || 'fair'] }}
+              </a-tag>
+            </div>
+            <a-progress
+              :percent="optimizationResult.qualityScore"
+              :stroke-color="qualityScoreColor(optimizationResult.qualityScore)"
+              :show-info="false"
+              size="small"
+            />
+          </div>
+        </div>
+
+        <!-- 问题列表 -->
+        <div class="optimization-section">
+          <h3 class="section-title">发现的问题</h3>
+          <ul class="issues-list">
+            <li v-for="(issue, idx) in optimizationResult.issues" :key="idx" class="issue-item">
+              {{ issue }}
+            </li>
+          </ul>
+        </div>
+        <!-- 优化后的提示词 -->
+        <div class="optimization-section">
+          <h3 class="section-title">优化后的提示词</h3>
+          <div class="optimized-prompt-box">
+            <pre class="optimized-prompt-text">{{ optimizationResult.optimizedPrompt }}</pre>
+            <a-button type="primary" size="small" style="margin-top: 12px" @click="applyOptimizedPrompt">
+              应用优化
+            </a-button>
+          </div>
+        </div>
+        <!-- 改进点 -->
+        <div class="optimization-section">
+          <h3 class="section-title">改进说明</h3>
+          <ul class="improvements-list">
+            <li
+              v-for="(improvement, idx) in optimizationResult.improvements"
+              :key="idx"
+              class="improvement-item"
+            >
+              {{ improvement }}
+            </li>
+          </ul>
+        </div>
+      </div>
+      <a-empty v-else description="暂无优化结果" />
+    </a-drawer>
+
+    <!-- 优化历史抽屉（功能扩展 3） -->
+    <a-drawer
+      v-model:open="historyDrawerVisible"
+      title="优化历史记录"
+      width="620px"
+      placement="right"
+    >
+      <div class="history-drawer">
+        <div v-if="optimizationHistory.length > 0" class="history-list">
+          <div v-for="record in optimizationHistory" :key="record.id" class="history-item">
+            <div class="history-item-head">
+              <div class="history-item-title">
+                <span class="history-time">{{ formatHistoryTime(record.createTime) }}</span>
+                <a-tag
+                  v-if="record.qualityScore != null"
+                  :color="QUALITY_LEVEL_COLOR[record.qualityLevel || 'fair']"
+                >
+                  {{ record.qualityScore }} 分 · {{ QUALITY_LEVEL_TEXT[record.qualityLevel || 'fair'] }}
+                </a-tag>
+              </div>
+              <div class="history-item-actions">
+                <a-button type="link" size="small" @click="reuseHistoryRecord(record)">
+                  再次优化
+                </a-button>
+                <a-button type="link" size="small" danger @click="removeHistoryRecord(record)">
+                  删除
+                </a-button>
+              </div>
+            </div>
+            <div class="history-original">
+              <span class="history-label">原始</span>
+              {{ record.originalPrompt }}
+            </div>
+            <div v-if="record.optimizedPrompt" class="history-optimized">
+              <span class="history-label">优化后</span>
+              {{ record.optimizedPrompt }}
+            </div>
+            <div class="history-item-foot">
+              <span v-if="record.issues.length" class="history-count">
+                {{ record.issues.length }} 个问题
+              </span>
+              <span v-if="record.improvements.length" class="history-count">
+                {{ record.improvements.length }} 项改进
+              </span>
+              <span v-if="record.evaluationModel" class="history-model">
+                评估模型：{{ record.evaluationModel }}
+              </span>
+            </div>
+          </div>
+        </div>
+        <a-empty v-else description="还没有优化记录" />
+      </div>
+    </a-drawer>
   </div>
 </template>
 
@@ -477,6 +812,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
+  AppstoreOutlined,
   BarChartOutlined,
   ClockCircleOutlined,
   CopyOutlined,
@@ -485,10 +821,17 @@ import {
   EditOutlined,
   ExpandOutlined,
   ExperimentOutlined,
+  HistoryOutlined,
   HomeOutlined,
+  LikeFilled,
+  LikeOutlined,
   LogoutOutlined,
+  PlusOutlined,
   RocketOutlined,
+  StarFilled,
+  StarOutlined,
   SwapOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import { API_BASE_URL } from '@/config/env'
 import { userLogout } from '@/api/user'
@@ -506,6 +849,24 @@ import {
   type StreamChunkVO,
 } from '@/api/conversation'
 import { listModels, type ModelVO } from '@/api/model'
+import {
+  createTemplate,
+  deleteOptimizationHistory,
+  fillTemplateVariables,
+  incrementUsage,
+  listCommunityTemplates,
+  listFavoriteTemplates,
+  listOptimizationHistory,
+  listTemplates,
+  optimizePrompt,
+  toggleTemplateFavorite,
+  toggleTemplateLike,
+  QUALITY_LEVEL_COLOR,
+  QUALITY_LEVEL_TEXT,
+  type PromptOptimizationHistoryVO,
+  type PromptOptimizationVO,
+  type PromptTemplateVO,
+} from '@/api/prompt'
 import { createPostSSE, type SSEHandle } from '@/utils/sseClient'
 import { MODE_OPTIONS, MODE_PROMPT_LAB, resolveModeNavigation } from '@/constants/mode'
 import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
@@ -1365,6 +1726,423 @@ const copyResult = async (result: VariantResult) => {
   }
 }
 
+/* ==================== 模板库 ==================== */
+const templateLibraryVisible = ref(false)
+const templates = ref<PromptTemplateVO[]>([])
+const selectedStrategy = ref<string>('')
+/** 模板要应用到哪个变体；打开模板库时若没选就默认第 1 个 */
+const selectedVariantIndex = ref<number>(0)
+
+/** 模板来源页签：全部 / 社区分享 / 我的收藏（功能扩展 2） */
+const templateTab = ref<'all' | 'community' | 'favorite'>('all')
+const communitySortBy = ref<'latest' | 'hot'>('latest')
+
+const emptyTemplateHint = computed(() => {
+  if (templateTab.value === 'community') return '社区里还没有公开分享的模板'
+  if (templateTab.value === 'favorite') return '还没有收藏任何模板'
+  return '暂无模板'
+})
+
+/** 创建自定义模板 */
+const createTemplateVisible = ref(false)
+const creatingTemplate = ref(false)
+const createTemplateForm = ref({
+  name: '',
+  strategy: 'direct',
+  description: '',
+  content: '',
+  isPublic: false,
+})
+
+/** 模板变量填写（功能扩展 1） */
+const variableFormVisible = ref(false)
+const fillingVariables = ref(false)
+const variableFormTemplate = ref<PromptTemplateVO | null>(null)
+const variableFormVariantIndex = ref(0)
+const variableFormFields = ref<{ name: string; value: string }[]>([])
+
+const strategyOptions = [
+  { value: 'direct', label: '直接提问' },
+  { value: 'cot', label: 'CoT (思维链)' },
+  { value: 'role_play', label: '角色扮演' },
+  { value: 'few_shot', label: 'Few-shot (示例学习)' },
+]
+
+/** 显示模板库 */
+const showTemplateLibrary = () => {
+  templateLibraryVisible.value = true
+  loadTemplates()
+  if (
+    selectedVariantIndex.value === null ||
+    selectedVariantIndex.value < 0 ||
+    selectedVariantIndex.value >= variants.value.length
+  ) {
+    selectedVariantIndex.value = 0
+  }
+}
+
+/** 切换模板来源页签 */
+const onTemplateTabChange = () => {
+  loadTemplates()
+}
+
+/** 加载模板列表（按当前页签走不同接口） */
+const loadTemplates = async () => {
+  try {
+    let res: any
+    if (templateTab.value === 'community') {
+      res = await listCommunityTemplates({
+        strategy: selectedStrategy.value || undefined,
+        sortBy: communitySortBy.value,
+      })
+    } else if (templateTab.value === 'favorite') {
+      res = await listFavoriteTemplates()
+    } else {
+      res = await listTemplates({
+        strategy: selectedStrategy.value || undefined,
+      })
+    }
+    if (res.data && res.data.code === 0 && res.data.data) {
+      templates.value = res.data.data
+    } else {
+      templates.value = []
+    }
+  } catch (error) {
+    console.error('加载模板列表失败:', error)
+    message.error('加载模板列表失败')
+  }
+}
+
+/** 解析模板里要用到的变量名（后端已返回，兜底再从前端 content 解析一次） */
+const resolveTemplateVariables = (template: PromptTemplateVO): string[] => {
+  if (template.variables && template.variables.length > 0) return template.variables
+  const matched = (template.content || '').match(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g) || []
+  const names: string[] = []
+  for (const token of matched) {
+    const name = token.slice(1, -1)
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+/** 选择模板：带变量的先弹表单填值（功能扩展 1），无变量的直接应用 */
+const selectTemplate = async (template: PromptTemplateVO) => {
+  if (!template.content) {
+    message.warning('模板内容为空')
+    return
+  }
+
+  const variableNames = resolveTemplateVariables(template)
+  const targetIndex =
+    selectedVariantIndex.value !== null &&
+    selectedVariantIndex.value >= 0 &&
+    selectedVariantIndex.value < variants.value.length
+      ? selectedVariantIndex.value
+      : 0
+
+  if (variableNames.length > 0) {
+    // 功能扩展 1：弹出表单让用户填写每个变量的值
+    variableFormTemplate.value = template
+    variableFormVariantIndex.value = targetIndex
+    variableFormFields.value = variableNames.map((name) => ({ name, value: '' }))
+    variableFormVisible.value = true
+    return
+  }
+
+  await applyTemplateContent(template, targetIndex, template.content)
+}
+
+/** 把内容写进目标变体并记一次使用 */
+const applyTemplateContent = async (
+  template: PromptTemplateVO,
+  targetIndex: number,
+  content: string,
+) => {
+  try {
+    if (template.id) {
+      await incrementUsage(template.id)
+    }
+    variants.value[targetIndex] = content
+    message.success(`模板已应用到变体 ${targetIndex + 1}`)
+    templateLibraryVisible.value = false
+    // 应用后同步刷新列表里的使用次数
+    loadTemplates()
+  } catch (error) {
+    console.error('应用模板失败:', error)
+    message.error('应用模板失败')
+  }
+}
+
+/** 提交变量表单（功能扩展 1）：调后端替换，结果写回变体输入框（仍可编辑） */
+const submitVariableForm = async () => {
+  if (fillingVariables.value) return
+  const template = variableFormTemplate.value
+  if (!template) return
+
+  const filled = variableFormFields.value.filter((f) => f.value.trim() !== '')
+  if (filled.length === 0) {
+    message.warning('请至少填写一个变量的值')
+    return
+  }
+
+  fillingVariables.value = true
+  try {
+    const variables: Record<string, string> = {}
+    for (const field of variableFormFields.value) {
+      variables[field.name] = field.value
+    }
+    const res: any = await fillTemplateVariables({
+      templateId: template.id,
+      variables,
+    })
+    if (res.data?.code === 0 && res.data.data) {
+      const { content, unfilledVariables } = res.data.data
+      variableFormVisible.value = false
+      await applyTemplateContent(template, variableFormVariantIndex.value, content)
+      if (unfilledVariables && unfilledVariables.length > 0) {
+        message.warning(`以下变量未填写，占位符已保留：${unfilledVariables.join('、')}`)
+      }
+    } else {
+      message.error(res.data?.message || '填充模板变量失败')
+    }
+  } catch (error) {
+    console.error('填充模板变量失败:', error)
+    message.error('填充模板变量失败')
+  } finally {
+    fillingVariables.value = false
+  }
+}
+
+/** 点赞 / 取消点赞（功能扩展 2） */
+const handleToggleLike = async (template: PromptTemplateVO) => {
+  try {
+    const res: any = await toggleTemplateLike(template.id)
+    if (res.data?.code === 0) {
+      const liked = res.data.data
+      template.liked = liked
+      template.likeCount = Math.max(0, (template.likeCount || 0) + (liked ? 1 : -1))
+      message.success(liked ? '已点赞' : '已取消点赞')
+    } else {
+      message.error(res.data?.message || '操作失败')
+    }
+  } catch (error) {
+    console.error('点赞失败:', error)
+    message.error('点赞失败')
+  }
+}
+
+/** 收藏 / 取消收藏（功能扩展 2） */
+const handleToggleFavorite = async (template: PromptTemplateVO) => {
+  try {
+    const res: any = await toggleTemplateFavorite(template.id)
+    if (res.data?.code === 0) {
+      const favorited = res.data.data
+      template.favorited = favorited
+      template.favoriteCount = Math.max(
+        0,
+        (template.favoriteCount || 0) + (favorited ? 1 : -1),
+      )
+      message.success(favorited ? '已收藏' : '已取消收藏')
+    } else {
+      message.error(res.data?.message || '操作失败')
+    }
+  } catch (error) {
+    console.error('收藏失败:', error)
+    message.error('收藏失败')
+  }
+}
+
+/** 打开创建模板弹窗：把当前变体内容预填进去，省得重新敲一遍 */
+const showCreateTemplateModal = () => {
+  const current = variants.value[selectedVariantIndex.value]
+  createTemplateForm.value = {
+    name: '',
+    strategy: selectedStrategy.value || 'direct',
+    description: '',
+    content: current || '',
+    isPublic: false,
+  }
+  createTemplateVisible.value = true
+}
+
+/** 提交创建自定义模板，成功后自动应用到选中的变体 */
+const submitCreateTemplate = async () => {
+  if (creatingTemplate.value) return
+  const form = createTemplateForm.value
+  if (!form.name.trim()) {
+    message.warning('请输入模板名称')
+    return
+  }
+  if (!form.content.trim()) {
+    message.warning('请输入模板内容')
+    return
+  }
+
+  creatingTemplate.value = true
+  try {
+    const res: any = await createTemplate({
+      name: form.name.trim(),
+      strategy: form.strategy,
+      description: form.description.trim() || undefined,
+      content: form.content,
+      isPublic: form.isPublic,
+    })
+    if (res.data?.code === 0) {
+      message.success('模板创建成功')
+      createTemplateVisible.value = false
+      await loadTemplates()
+    } else {
+      message.error(res.data?.message || '创建模板失败')
+    }
+  } catch (error) {
+    message.error('创建模板失败: ' + (error as Error).message)
+  } finally {
+    creatingTemplate.value = false
+  }
+}
+
+/* ==================== AI 优化 ==================== */
+
+// 优化相关状态
+const optimizingIndex = ref<number | null>(null)
+const optimizationDrawerVisible = ref(false)
+const optimizationResult = ref<PromptOptimizationVO | null>(null)
+const currentOptimizingVariantIndex = ref<number | null>(null)
+
+// 优化提示词
+const handleOptimizePrompt = async (variantIndex: number) => {
+  const prompt = variants.value[variantIndex]
+  if (!prompt || prompt.trim() === '') {
+    message.warning('请先输入提示词')
+    return
+  }
+
+  optimizingIndex.value = variantIndex
+  currentOptimizingVariantIndex.value = variantIndex
+  optimizationResult.value = null
+
+  try {
+    // 如果这个变体已经跑过实验，把最后一条回答一并交给 AI，让它结合实际效果分析
+    let aiResponse: string | undefined = undefined
+    if (messages.value.length > 0) {
+      const lastAssistantMsg = messages.value.filter((m) => m.type === 'assistant').pop()
+      if (
+        lastAssistantMsg &&
+        lastAssistantMsg.results &&
+        lastAssistantMsg.results[variantIndex]
+      ) {
+        aiResponse = lastAssistantMsg.results[variantIndex].fullContent
+      }
+    }
+
+    const res: any = await optimizePrompt({
+      originalPrompt: prompt,
+      aiResponse: aiResponse,
+    })
+
+    if (res.data && res.data.code === 0 && res.data.data) {
+      optimizationResult.value = res.data.data
+      optimizationDrawerVisible.value = true
+      message.success('优化分析完成')
+    } else {
+      message.error(res.data?.message || '优化失败')
+    }
+  } catch (error) {
+    console.error('优化提示词失败:', error)
+    message.error('优化失败: ' + (error instanceof Error ? error.message : '未知错误'))
+  } finally {
+    optimizingIndex.value = null
+  }
+}
+
+// 应用优化后的提示词
+const applyOptimizedPrompt = () => {
+  if (optimizationResult.value && currentOptimizingVariantIndex.value !== null) {
+    variants.value[currentOptimizingVariantIndex.value] =
+      optimizationResult.value.optimizedPrompt
+    message.success('已应用优化后的提示词')
+    optimizationDrawerVisible.value = false
+  }
+}
+
+/* ==================== 功能扩展 3：优化历史记录 ==================== */
+
+const historyDrawerVisible = ref(false)
+const optimizationHistory = ref<PromptOptimizationHistoryVO[]>([])
+
+/** 显示优化历史抽屉 */
+const showOptimizationHistory = async () => {
+  historyDrawerVisible.value = true
+  await loadOptimizationHistory()
+}
+
+/** 加载优化历史 */
+const loadOptimizationHistory = async () => {
+  try {
+    const res: any = await listOptimizationHistory({ limit: 50 })
+    if (res.data?.code === 0 && res.data.data) {
+      optimizationHistory.value = res.data.data
+    } else {
+      optimizationHistory.value = []
+    }
+  } catch (error) {
+    console.error('加载优化历史失败:', error)
+    message.error('加载优化历史失败')
+  }
+}
+
+/** 删除一条优化历史 */
+const removeHistoryRecord = async (record: PromptOptimizationHistoryVO) => {
+  try {
+    const res: any = await deleteOptimizationHistory(record.id)
+    if (res.data?.code === 0) {
+      optimizationHistory.value = optimizationHistory.value.filter(
+        (item) => item.id !== record.id,
+      )
+      message.success('已删除')
+    } else {
+      message.error(res.data?.message || '删除失败')
+    }
+  } catch (error) {
+    console.error('删除优化历史失败:', error)
+    message.error('删除优化历史失败')
+  }
+}
+
+/** 把历史记录里的原始提示词拿回变体，方便再次优化对比 */
+const reuseHistoryRecord = (record: PromptOptimizationHistoryVO) => {
+  const targetIndex =
+    currentOptimizingVariantIndex.value !== null &&
+    currentOptimizingVariantIndex.value >= 0 &&
+    currentOptimizingVariantIndex.value < variants.value.length
+      ? currentOptimizingVariantIndex.value
+      : 0
+  variants.value[targetIndex] = record.originalPrompt
+  historyDrawerVisible.value = false
+  message.success(`已填入变体 ${targetIndex + 1}，可再次点击「优化」`)
+}
+
+/** 格式化历史记录时间：只保留到分钟 */
+const formatHistoryTime = (createTime?: string) => {
+  if (!createTime) return '-'
+  const date = new Date(createTime)
+  if (Number.isNaN(date.getTime())) return createTime
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  )
+}
+
+/** 质量评分对应的进度条颜色（功能扩展 4） */
+const qualityScoreColor = (score?: number) => {
+  if (score == null) return '#8c8c8c'
+  if (score >= 90) return '#52c41a'
+  if (score >= 75) return '#1677ff'
+  if (score >= 60) return '#fa8c16'
+  return '#ff4d4f'
+}
+
 /* ==================== 用户 ==================== */
 
 const doLogout = async () => {
@@ -1997,6 +2775,396 @@ const doLogout = async () => {
   margin-bottom: 6px;
   font-size: 12px;
   color: #6b7280;
+}
+
+/* ==================== 变体卡片头部：优化按钮 ==================== */
+.pl-variant-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pl-optimize-btn {
+  padding: 0 4px;
+  height: 24px;
+  font-size: 12px;
+}
+
+/* ==================== 模板库抽屉 ==================== */
+.template-library {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+}
+
+.strategy-filter {
+  flex: 0 0 auto;
+}
+
+.template-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.template-item {
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fff;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.template-item:hover {
+  border-color: #1677ff;
+  box-shadow: 0 2px 10px rgba(22, 119, 255, 0.12);
+}
+
+.template-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.template-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.template-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2328;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-description {
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.template-preview {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f7f8fa;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #8a93a0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.template-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #b0b6bf;
+}
+
+.template-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.template-author {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 点赞 / 收藏按钮（功能扩展 2） */
+.template-interactions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.template-interact-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  color: #8a93a0;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.template-interact-btn:hover {
+  border-color: #1677ff;
+  color: #1677ff;
+}
+
+.template-interact-btn.active {
+  border-color: #1677ff;
+  background: #e6f4ff;
+  color: #1677ff;
+}
+
+/* 模板变量填写弹窗（功能扩展 1） */
+.variable-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.variable-form-tip {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f0f5ff;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #2f54eb;
+}
+
+.variable-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.variable-form-field label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #5b6472;
+}
+
+.pl-generate-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #8a93a0;
+}
+
+.template-actions {
+  flex: 0 0 auto;
+}
+
+/* 质量评分卡片（功能扩展 4） */
+.quality-score-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fafbfc;
+}
+
+.quality-score-left {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.quality-score-value {
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.quality-score-value.quality-excellent {
+  color: #52c41a;
+}
+.quality-score-value.quality-good {
+  color: #1677ff;
+}
+.quality-score-value.quality-fair {
+  color: #fa8c16;
+}
+.quality-score-value.quality-poor {
+  color: #ff4d4f;
+}
+
+.quality-score-unit {
+  font-size: 13px;
+  color: #b0b6bf;
+}
+
+.quality-score-right {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quality-score-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2328;
+}
+
+/* ==================== 优化历史抽屉（功能扩展 3） ==================== */
+.history-drawer {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.history-item {
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.history-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.history-item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.history-time {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2328;
+}
+
+.history-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.history-original,
+.history-optimized {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #5b6472;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.history-original {
+  background: #f7f8fa;
+}
+
+.history-optimized {
+  background: #f6ffed;
+}
+
+.history-label {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #e6f4ff;
+  font-size: 11px;
+  color: #1677ff;
+}
+
+.history-item-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: #b0b6bf;
+}
+
+.history-count {
+  color: #8a93a0;
+}
+
+/* ==================== 优化结果抽屉 ==================== */
+.optimization-result {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.optimization-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2328;
+}
+
+.issues-list,
+.improvements-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.issue-item {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #cf1322;
+}
+
+.improvement-item {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #237804;
+}
+
+.optimized-prompt-box {
+  padding: 12px 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f7f8fa;
+}
+
+.optimized-prompt-text {
+  margin: 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.8;
+  color: #1f2328;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .pl-subrun-label {
   background: #f3f4f6;

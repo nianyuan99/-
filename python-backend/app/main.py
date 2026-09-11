@@ -8,7 +8,19 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import batch_test, conversation, health, model, rating, report, scene, test, user
+from app.api import (
+    batch_test,
+    conversation,
+    health,
+    model,
+    prompt_optimization,
+    prompt_template,
+    rating,
+    report,
+    scene,
+    test,
+    user,
+)
 from app.core.config import get_settings
 from app.core.logging_config import LoggingConfig
 from app.core.scheduler import setup_scheduler, shutdown_scheduler
@@ -56,6 +68,8 @@ app.include_router(model.router, prefix="/api")
 app.include_router(scene.router, prefix="/api")
 app.include_router(batch_test.router, prefix="/api")
 app.include_router(report.router, prefix="/api")
+app.include_router(prompt_template.router, prefix="/api")
+app.include_router(prompt_optimization.router, prefix="/api")
 
 # WebSocket 不挂在 /api 下：前端 sockjs-client 连接的是 /ws，
 # 再加一层 /api 前缀会和 Java 版的路径约定不一致
