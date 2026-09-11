@@ -47,6 +47,14 @@ frontend/.vite/
 *.log.*
 python-backend/logs/
 
+# 本地验证 / 夹具脚本（只在本机使用，不入库）
+#
+# app/scripts 下是开发期工具：直接读写本地库的夹具脚本（seed_code_fixture.py）
+# 与端到端验证脚本（verify_*.py / verify_*_ui.js）。
+# 它们硬编码了本地端口（9090）与具体的免费模型 ID，且夹具脚本会往库里建测试账号，
+# 放进公开仓库既跑不通也容易误执行，因此统一保留在本地、不纳入版本控制。
+python-backend/app/scripts/
+
 # Coverage
 htmlcov/
 .coverage
