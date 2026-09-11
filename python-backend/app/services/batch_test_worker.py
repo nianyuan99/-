@@ -51,6 +51,39 @@ def get_sync_session() -> Session:
     return SessionLocal()
 
 
+def _check_enable_ai_scoring(config: dict) -> bool:
+    """
+    检查任务是否启用 AI 评分
+
+    配置来自子任务数据（任务级高级参数会原样透传给每个子任务），
+    前端勾选「启用 AI 评分」时传的是 boolean，接口传字符串时也做兼容。
+    """
+    if not isinstance(config, dict):
+        return False
+    enable = config.get("enableAiScoring")
+    if isinstance(enable, bool):
+        return enable
+    if isinstance(enable, str):
+        return enable.lower() in ("true", "1", "yes")
+    return False
+
+
+def _build_sync_client() -> OpenAI:
+    """
+    创建一个同步 OpenAI 客户端
+
+    每个子任务独立创建 client：worker 跑在线程池里，共享一个 client 会引入
+    线程安全问题，而客户端创建本身几乎无开销（真正耗时的是网络请求）。
+    """
+    return OpenAI(
+        api_key=settings.OPENROUTER_API_KEY,
+        base_url=settings.OPENROUTER_BASE_URL,
+        default_headers=OPENROUTER_EXTRA_HEADERS,
+        timeout=settings_batch_timeout(),
+        max_retries=0,
+    )
+
+
 def run_subtask_sync(sub_task_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     执行单个子任务：让某个模型回答某条提示词
@@ -80,9 +113,10 @@ def run_subtask_sync(sub_task_data: Dict[str, Any]) -> Dict[str, Any]:
             return {"taskId": task_id, "modelName": model_name, "skipped": True}
 
         # 2. 调用模型
+        prompt_content = sub_task_data.get("promptContent") or ""
         output_text, reasoning, input_tokens, output_tokens, response_time_ms = _call_model(
             model_name=model_name,
-            prompt_content=sub_task_data.get("promptContent") or "",
+            prompt_content=prompt_content,
             temperature=sub_task_data.get("temperature"),
             max_tokens=sub_task_data.get("maxTokens"),
         )
@@ -94,37 +128,60 @@ def run_subtask_sync(sub_task_data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # 4. 保存测试结果
-        session.add(
-            TestResult(
-                id=result_id,
-                task_id=task_id,
-                user_id=sub_task_data["userId"],
-                scene_id=sub_task_data.get("sceneId"),
-                prompt_id=sub_task_data.get("promptId"),
-                model_name=model_name,
-                input_prompt=sub_task_data.get("promptContent") or "",
-                output_text=output_text,
-                reasoning=reasoning,
-                response_time_ms=response_time_ms,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=Decimal(str(cost)),
-                is_delete=0,
-            )
+        test_result = TestResult(
+            id=result_id,
+            task_id=task_id,
+            user_id=sub_task_data["userId"],
+            scene_id=sub_task_data.get("sceneId"),
+            prompt_id=sub_task_data.get("promptId"),
+            model_name=model_name,
+            input_prompt=prompt_content,
+            output_text=output_text,
+            reasoning=reasoning,
+            response_time_ms=response_time_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=Decimal(str(cost)),
+            is_delete=0,
         )
+        session.add(test_result)
 
-        # 5. 原子更新任务进度：用 completedSubtasks = completedSubtasks + 1 自增，
+        # 5. AI 评分：放在 session.add() 之后、session.commit() 之前
+        #    这样评分结果和测试结果在同一个事务里写入，要么都成功要么都不存；
+        #    如果放在 commit 之后单独更新，万一更新评分时数据库出问题，
+        #    就会出现「测试结果有了但 AI 评分丢了」的不一致状态。
+        #    注意用的是同步版 run_ai_scoring_sync —— Worker 跑在线程池里，没有事件循环。
+        config = sub_task_data
+        enable_ai_scoring = _check_enable_ai_scoring(config)
+        if enable_ai_scoring and output_text:
+            from app.schemas.evaluation import ai_score_result_to_json
+            from app.services.ai_scoring_service import run_ai_scoring_sync
+
+            ai_result = run_ai_scoring_sync(
+                sync_session=session,
+                openai_sync_client=_build_sync_client(),
+                question=prompt_content,
+                model_response=output_text,
+                tested_model_name=model_name,
+                extra_headers=OPENROUTER_EXTRA_HEADERS,
+                user_id=sub_task_data.get("userId"),
+                redis_client=get_redis(),
+            )
+            if ai_result is not None:
+                test_result.ai_score = ai_score_result_to_json(ai_result)
+
+        # 6. 原子更新任务进度：用 completedSubtasks = completedSubtasks + 1 自增，
         #    避免多个线程同时写导致计数丢失；状态流转用 CASE WHEN 在一条 SQL 里完成
         completed_subtasks, total_subtasks, status = _advance_task_progress(session, task_id)
 
-        # 6. 累加用户-模型使用统计
+        # 7. 累加用户-模型使用统计
         update_user_model_usage_sync(
             session, sub_task_data["userId"], model_name, (input_tokens or 0) + (output_tokens or 0), cost
         )
 
         session.commit()
 
-        # 7. 推送进度：不是每个子任务都推，按间隔推送 + 任务结束时必推
+        # 8. 推送进度：不是每个子任务都推，按间隔推送 + 任务结束时必推
         _push_subtask_progress(
             task_id=task_id,
             total_subtasks=total_subtasks,
@@ -201,20 +258,12 @@ def _call_model(
     """
     调用 OpenRouter 对话接口
 
-    每个子任务独立创建 client：worker 跑在线程池里，共享一个 client 会引入
-    线程安全问题，而客户端创建本身几乎无开销（真正耗时的是网络请求）。
+    客户端由 `_build_sync_client()` 每次新建（见该函数的说明）。
 
     Returns:
         (输出内容, 思考过程, 输入Token, 输出Token, 响应时间毫秒)
     """
-    timeout_seconds = settings_batch_timeout()
-    client = OpenAI(
-        api_key=settings.OPENROUTER_API_KEY,
-        base_url=settings.OPENROUTER_BASE_URL,
-        default_headers=OPENROUTER_EXTRA_HEADERS,
-        timeout=timeout_seconds,
-        max_retries=0,
-    )
+    client = _build_sync_client()
 
     start_time = time.time()
     response = client.chat.completions.create(

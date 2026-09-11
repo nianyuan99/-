@@ -79,6 +79,11 @@
             placeholder="2000"
           />
         </a-form-item>
+        <a-form-item label="启用 AI 评分" name="enableAiScoring">
+          <a-checkbox v-model:checked="form.enableAiScoring">
+            让多个 AI 评委给每条回答交叉打分（会增加耗时与费用）
+          </a-checkbox>
+        </a-form-item>
         <a-form-item :wrapper-col="{ offset: 6, span: 18 }">
           <a-button type="primary" :loading="creating" @click="handleCreate">
             创建测试任务
@@ -136,14 +141,16 @@
       </div>
 
       <div style="margin-top: 16px">
+        <a-button style="margin-left: 8px" @click="handleViewDetail"> 查看详情 </a-button>
         <a-button
-          v-if="currentTask.status === 'completed' || currentTask.status === 'failed'"
+          v-if="currentTask && currentTask.status === 'completed'"
           type="primary"
+          style="margin-left: 8px"
           @click="handleViewReport"
         >
           查看报告
         </a-button>
-        <a-button style="margin-left: 8px" @click="handleBackToList">返回列表</a-button>
+        <a-button style="margin-left: 8px" @click="handleBackToList"> 返回列表 </a-button>
       </div>
     </a-card>
 
@@ -300,6 +307,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import dayjs from 'dayjs'
 import { listModels, type ModelVO } from '@/api/model.ts'
@@ -354,18 +362,22 @@ const loadingScenes = ref(false)
 const loadingModels = ref(false)
 const creating = ref(false)
 
+const router = useRouter()
+
 const form = reactive<{
   name?: string
   sceneId?: string
   models: string[]
   temperature?: number
   maxTokens?: number
+  enableAiScoring?: boolean
 }>({
   name: '',
   sceneId: undefined,
   models: [],
   temperature: 0.7,
   maxTokens: 2000,
+  enableAiScoring: false,
 })
 
 const modelOptions = computed(() =>
@@ -533,6 +545,7 @@ const handleCreate = async () => {
       models: form.models,
       temperature: form.temperature,
       maxTokens: form.maxTokens,
+      enableAiScoring: form.enableAiScoring,
     })
     if (res.data.code !== 0 || !res.data.data) {
       message.error('创建任务失败，' + res.data.message)
@@ -592,9 +605,18 @@ const handleCancelTask = async () => {
   }
 }
 
-const handleViewReport = () => {
+/** 在当前页展开测试结果列表（详情） */
+const handleViewDetail = () => {
   showReport.value = true
   fetchResults()
+}
+
+/** 跳转到独立的测试报告页：雷达图 / 柱状图 / 模型统计 / PDF 导出 */
+const handleViewReport = () => {
+  if (!currentTask.value) {
+    return
+  }
+  router.push({ path: '/test/report', query: { taskId: currentTask.value.id } })
 }
 
 const handleBackToList = () => {

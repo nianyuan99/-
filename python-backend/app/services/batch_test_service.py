@@ -87,6 +87,11 @@ class BatchTestService:
         max_tokens = request_data.get("max_tokens") or request_data.get("maxTokens")
         if max_tokens is None:
             max_tokens = BATCH_TEST_DEFAULT_MAX_TOKENS
+        # 是否启用 AI 评分（高级参数，默认关闭）：启用后 Worker 会在保存每条结果时
+        # 顺带跑一次多评委交叉评分，写进 test_result.aiScore
+        enable_ai_scoring = bool(
+            request_data.get("enable_ai_scoring") or request_data.get("enableAiScoring")
+        )
 
         # 校验模型是否真实存在，避免任务创建成功但每个子任务都失败
         await BatchTestService._validate_models(db, models)
@@ -141,14 +146,16 @@ class BatchTestService:
             user_id=user_id,
             temperature=float(temperature),
             max_tokens=int(max_tokens),
+            enable_ai_scoring=enable_ai_scoring,
         )
 
         logger.info(
-            "批量测试任务已创建: taskId=%s, models=%s, prompts=%s, total=%s",
+            "批量测试任务已创建: taskId=%s, models=%s, prompts=%s, total=%s, aiScoring=%s",
             task_id,
             models,
             len(prompts),
             total_subtasks,
+            enable_ai_scoring,
         )
         return task_id
 
@@ -161,6 +168,7 @@ class BatchTestService:
         user_id: int,
         temperature: float,
         max_tokens: int,
+        enable_ai_scoring: bool = False,
     ) -> None:
         """
         拆分并异步调度子任务
@@ -195,6 +203,7 @@ class BatchTestService:
                     "userId": user_id,
                     "temperature": temperature,
                     "maxTokens": max_tokens,
+                    "enableAiScoring": enable_ai_scoring,
                 }
                 scheduled.append(asyncio.create_task(run_subtask_with_semaphore(sub_task_data)))
 

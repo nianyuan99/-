@@ -22,6 +22,22 @@ export interface TestTaskVO {
   updateTime: string
 }
 
+/** 单个 AI 评委的评分明细 */
+export interface AIScoreJudge {
+  model: string
+  scores: Record<string, number>
+  totalScore: number
+  rating: number
+  comment?: string
+}
+
+/** AI 评分详情（多评委汇总，对应后端 AIScoreResult） */
+export interface AIScoreDetail {
+  judges?: AIScoreJudge[]
+  averageRating?: number
+  consistency?: number
+}
+
 export interface TestResultVO {
   id: string
   taskId: string
@@ -38,7 +54,7 @@ export interface TestResultVO {
   outputTokens?: number
   cost?: number
   userRating?: number
-  aiScore?: Record<string, unknown>
+  aiScore?: AIScoreDetail
   createTime: string
 }
 
@@ -48,6 +64,8 @@ export interface CreateBatchTestRequest {
   models: string[]
   temperature?: number
   maxTokens?: number
+  /** 是否启用 AI 评分（启用后每条结果由多个 AI 评委交叉打分） */
+  enableAiScoring?: boolean
 }
 
 export interface BatchTestTaskQueryRequest {

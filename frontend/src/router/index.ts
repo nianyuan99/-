@@ -78,6 +78,13 @@ const router = createRouter({
       component: () => import('@/pages/StatisticsPage.vue'),
       meta: { title: '数据统计' },
     },
+    {
+      path: '/test/report',
+      name: 'TestReportPage',
+      component: () => import('@/pages/TestReportPage.vue'),
+      // 报告页通过 query 里的 taskId 拉取数据（/test/report?taskId=xxx）
+      meta: { title: '测试报告' },
+    },
   ],
 })
 

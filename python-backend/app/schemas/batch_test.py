@@ -43,6 +43,11 @@ class CreateBatchTestRequest(BaseModel):
         le=BATCH_TEST_MAX_TOKENS_MAX,
         description="单次回答的最大 Token 数（高级参数，可选）",
     )
+    enable_ai_scoring: Optional[bool] = Field(
+        False,
+        alias="enableAiScoring",
+        description="是否启用 AI 评分（高级参数，可选）：启用后每条测试结果会由多个 AI 评委交叉打分",
+    )
 
     model_config = {"populate_by_name": True, "protected_namespaces": ()}
 
@@ -143,6 +148,32 @@ class TestResultVO(BaseModel):
     create_time: datetime = Field(..., alias="createTime", description="创建时间")
 
     model_config = {"populate_by_name": True, "protected_namespaces": (), "from_attributes": True}
+
+    @field_validator("ai_score", mode="before")
+    @classmethod
+    def _parse_ai_score(cls, value: Any) -> Any:
+        """
+        兼容 aiScore 的两种读法
+
+        写入时用的是 `ai_score_result_to_json()` 产出的 JSON **字符串**，而
+        `aiScore` 列是 JSON 类型，MySQL 会把整个字符串当成一个 JSON 值存下来，
+        读出来仍是 str（如 '{"judges": [...], ...}'）。这里统一解析成 dict 再交给
+        Pydantic，保证接口对外始终是对象（前端 TS 类型声明的就是对象），
+        解析失败退化为 None，不影响整张结果列表的渲染。
+        """
+        if value is None or isinstance(value, dict):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", errors="ignore")
+        if isinstance(value, str):
+            if not value.strip():
+                return None
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
 
 
 class TaskProgressVO(BaseModel):
