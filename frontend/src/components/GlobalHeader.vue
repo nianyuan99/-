@@ -53,7 +53,15 @@ import { useRouter } from 'vue-router'
 import { type MenuProps, message } from 'ant-design-vue'
 import { useLoginUserStore } from '@/stores/loginUser.ts'
 import { userLogout } from '@/api/user.ts'
-import { LogoutOutlined, HomeOutlined, SwapOutlined } from '@ant-design/icons-vue'
+import {
+  AppstoreOutlined,
+  BarChartOutlined,
+  ExperimentOutlined,
+  HomeOutlined,
+  LogoutOutlined,
+  RobotOutlined,
+  SwapOutlined,
+} from '@ant-design/icons-vue'
 
 const loginUserStore = useLoginUserStore()
 const router = useRouter()
@@ -61,6 +69,8 @@ const router = useRouter()
 const selectedKeys = ref<string[]>(['/'])
 // 监听路由变化，更新当前选中菜单
 router.afterEach((to) => {
+  // 全屏页面（模型对比 / 提示词实验 / 代码模式）自带左侧栏，没有顶部导航，
+  // 这里只在匹配到菜单路径时才更新选中项
   selectedKeys.value = [to.path]
 })
 
@@ -77,6 +87,30 @@ const originItems = [
     icon: () => h(SwapOutlined),
     label: '模型对比',
     title: '模型对比',
+  },
+  {
+    key: '/batch-test',
+    icon: () => h(ExperimentOutlined),
+    label: '批量测试',
+    title: '批量测试',
+  },
+  {
+    key: '/scene-manage',
+    icon: () => h(AppstoreOutlined),
+    label: '场景管理',
+    title: '场景管理',
+  },
+  {
+    key: '/statistics',
+    icon: () => h(BarChartOutlined),
+    label: '数据统计',
+    title: '数据统计',
+  },
+  {
+    key: '/model-manage',
+    icon: () => h(RobotOutlined),
+    label: '模型管理',
+    title: '模型管理',
   },
   {
     key: '/admin/userManage',

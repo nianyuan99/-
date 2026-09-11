@@ -36,6 +36,8 @@ Thumbs.db
 node_modules/
 frontend/dist/
 frontend/.vite/
+# npm 缓存目录：本项目把 npm cache 放在工作区内（避免写到用户目录被系统拒绝）
+.npm-cache/
 
 # Obsidian (don't track user vault content)
 .obsidian/

@@ -5,6 +5,17 @@ import type { BaseResponse, PageResult } from '@/api/user.ts'
  * 对话与评分相关接口类型定义（与后端 Pydantic 模型对应）
  */
 
+/** 从回答里提取出的一个代码块 */
+export interface CodeBlockVO {
+  language: string
+  code: string
+  /** 在原文中的起止位置（HTML 代码块才有实际意义） */
+  startIndex?: number
+  endIndex?: number
+  /** 后端做预览处理后的 HTML（目前原样返回，安全由 iframe sandbox 负责） */
+  sanitizedHtml?: string
+}
+
 /** SSE 流式响应数据块 */
 export interface StreamChunkVO {
   conversationId?: string
@@ -25,6 +36,9 @@ export interface StreamChunkVO {
   reasoning?: string
   hasReasoning?: boolean
   thinkingTime?: number
+  /** 代码模式：done 事件里直接带回解析好的代码块 */
+  codeBlocks?: CodeBlockVO[]
+  hasCodeBlocks?: boolean
 }
 
 export interface ConversationVO {
@@ -32,6 +46,8 @@ export interface ConversationVO {
   title?: string
   conversationType: string
   models: string[]
+  /** 是否启用代码预览（1-启用 0-不启用） */
+  codePreviewEnabled?: number
   totalTokens?: number
   totalCost?: number
   createTime: string
@@ -52,11 +68,15 @@ export interface ConversationMessageVO {
   outputTokens?: number
   cost?: number
   reasoning?: string
+  /** 从回答里提取的代码块（代码模式；没有代码块时为 undefined） */
+  codeBlocks?: CodeBlockVO[]
   createTime: string
 }
 
 export interface ConversationQueryRequest {
   conversationType?: string
+  /** 按是否启用代码预览筛选：代码模式页传 true，普通对比页传 false 以排除代码会话 */
+  codePreviewEnabled?: boolean
   current?: number
   pageSize?: number
 }
@@ -105,6 +125,30 @@ export interface GenerateVariantsRequest {
   basePrompt: string
   count: number
   model?: string
+}
+
+/**
+ * 代码模式请求：多模型并排生成可运行代码
+ *
+ * 流式接口统一走 createPostSSE，这里的类型只用于约束请求体字段。
+ */
+export interface CodeModeRequest {
+  models: string[]
+  prompt: string
+  imageUrls?: string[]
+  conversationId?: string
+  stream?: boolean
+  webSearchEnabled?: boolean
+}
+
+/** 代码模式提示词实验请求：同模型 + 多提示词变体 + 代码生成 */
+export interface CodeModePromptLabRequest {
+  model: string
+  promptVariants: string[]
+  variantImageUrls?: string[][]
+  conversationId?: string
+  stream?: boolean
+  webSearchEnabled?: boolean
 }
 
 /**

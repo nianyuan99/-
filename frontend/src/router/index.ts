@@ -47,6 +47,37 @@ const router = createRouter({
       // 与模型对比页同构：自带左侧会话栏，隐藏全局顶部导航
       meta: { title: '提示词实验', fullscreen: true },
     },
+    {
+      path: '/code-mode',
+      name: 'CodeModePage',
+      component: () => import('@/pages/CodeModePage.vue'),
+      // 代码模式：左侧会话栏 + 中间对话 + 右侧实时预览，同样占满整个视口
+      meta: { title: '代码模式', fullscreen: true },
+    },
+    {
+      path: '/scene-manage',
+      name: 'SceneManagePage',
+      component: () => import('@/pages/SceneManagePage.vue'),
+      meta: { title: '场景管理' },
+    },
+    {
+      path: '/batch-test',
+      name: 'BatchTestPage',
+      component: () => import('@/pages/BatchTestPage.vue'),
+      meta: { title: '批量测试' },
+    },
+    {
+      path: '/model-manage',
+      name: 'ModelManagePage',
+      component: () => import('@/pages/ModelManagePage.vue'),
+      meta: { title: '模型管理' },
+    },
+    {
+      path: '/statistics',
+      name: 'StatisticsPage',
+      component: () => import('@/pages/StatisticsPage.vue'),
+      meta: { title: '数据统计' },
+    },
   ],
 })
 

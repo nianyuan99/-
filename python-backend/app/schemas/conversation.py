@@ -6,11 +6,12 @@
 序列化后即为前端可直接消费的驼峰格式。
 """
 
+import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.constants import MAX_PROMPT_VARIANTS_COUNT, MIN_PROMPT_VARIANTS_COUNT
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============ 请求模型 ============
@@ -68,6 +69,46 @@ class PromptLabRequest(BaseModel):
     model_config = {"populate_by_name": True, "protected_namespaces": ()}
 
 
+class CodeModeRequest(BaseModel):
+    """Code Mode 代码模式请求：多模型并排生成可运行代码"""
+
+    models: List[str] = Field(..., description="模型列表（1-8个）")
+    prompt: str = Field(..., description="需求描述")
+    image_urls: Optional[List[str]] = Field(None, alias="imageUrls", description="图片URL列表（可选）")
+    conversation_id: Optional[str] = Field(
+        None, alias="conversationId", description="对话ID，多轮对话时传入"
+    )
+    stream: Optional[bool] = Field(True, description="是否使用流式响应")
+    web_search_enabled: Optional[bool] = Field(
+        False, alias="webSearchEnabled", description="是否启用联网搜索"
+    )
+
+    model_config = {"populate_by_name": True, "protected_namespaces": ()}
+
+
+class CodeModePromptLabRequest(BaseModel):
+    """Code Mode 提示词实验请求（代码模式下的多提示词对比）"""
+
+    model: str = Field(..., description="模型名称")
+    prompt_variants: List[str] = Field(
+        ..., alias="promptVariants", description="提示词变体列表（2-5个）"
+    )
+    variant_image_urls: Optional[List[List[str]]] = Field(
+        None,
+        alias="variantImageUrls",
+        description="变体图片URL列表（可选，与 promptVariants 一一对应）",
+    )
+    conversation_id: Optional[str] = Field(
+        None, alias="conversationId", description="对话ID，多轮对话时传入"
+    )
+    stream: Optional[bool] = Field(True, description="是否使用流式响应")
+    web_search_enabled: Optional[bool] = Field(
+        False, alias="webSearchEnabled", description="是否启用联网搜索"
+    )
+
+    model_config = {"populate_by_name": True, "protected_namespaces": ()}
+
+
 class RatingRequest(BaseModel):
     """用户评分请求"""
 
@@ -92,6 +133,11 @@ class ConversationQueryRequest(BaseModel):
 
     conversation_type: Optional[str] = Field(
         None, alias="conversationType", description="对话类型: side_by_side/prompt_lab/battle"
+    )
+    code_preview_enabled: Optional[bool] = Field(
+        None,
+        alias="codePreviewEnabled",
+        description="按是否启用代码预览筛选：代码模式页面传 true，普通对比页传 false 以排除代码会话",
     )
     current: int = Field(default=1, ge=1, description="当前页码")
     page_size: int = Field(default=10, ge=1, le=100, alias="pageSize", description="每页条数")
@@ -122,6 +168,13 @@ class StreamChunkVO(BaseModel):
     reasoning: Optional[str] = Field(None, description="思考过程")
     has_reasoning: Optional[bool] = Field(None, alias="hasReasoning", description="是否有思考过程")
     thinking_time: Optional[int] = Field(None, alias="thinkingTime", description="思考时间（秒）")
+    # 代码模式：done 事件里直接带回解析好的代码块，前端不用再自己解析 Markdown
+    code_blocks: Optional[List[Dict[str, Any]]] = Field(
+        None, alias="codeBlocks", description="代码块列表"
+    )
+    has_code_blocks: Optional[bool] = Field(
+        None, alias="hasCodeBlocks", description="是否包含代码块"
+    )
 
     model_config = {"protected_namespaces": (), "populate_by_name": True}
 
@@ -143,9 +196,36 @@ class ConversationMessageVO(BaseModel):
     output_tokens: Optional[int] = Field(None, alias="outputTokens", description="输出Token数")
     cost: Optional[float] = Field(None, description="成本（USD）")
     reasoning: Optional[str] = Field(None, description="思考过程")
+    code_blocks: Optional[List[Dict[str, Any]]] = Field(
+        None, alias="codeBlocks", description="代码块列表（代码模式，从库里的 JSON 字符串解析）"
+    )
     create_time: datetime = Field(..., alias="createTime", description="创建时间")
 
     model_config = {"populate_by_name": True, "protected_namespaces": (), "from_attributes": True}
+
+    @field_validator("code_blocks", mode="before")
+    @classmethod
+    def _parse_code_blocks(cls, value: Any) -> Any:
+        """
+        数据库里 codeBlocks 存的是 JSON 字符串，这里先解析成 list 再交给 Pydantic 校验
+
+        解析失败（历史脏数据、手工改库等）时返回 None，而不是让整个接口 500 ——
+        代码块只是展示增强，不该拖垮历史消息查询。
+        """
+        if value is None or isinstance(value, (list, tuple)):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", errors="ignore")
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, list) else None
 
 
 class RatingVO(BaseModel):
@@ -175,6 +255,9 @@ class ConversationVO(BaseModel):
     title: Optional[str] = Field(None, description="对话标题")
     conversation_type: str = Field(..., alias="conversationType", description="对话类型")
     models: List[str] = Field(default_factory=list, description="参与的模型列表")
+    code_preview_enabled: Optional[int] = Field(
+        None, alias="codePreviewEnabled", description="是否启用代码预览（1-启用 0-不启用）"
+    )
     total_tokens: Optional[int] = Field(None, alias="totalTokens", description="总Token消耗")
     total_cost: Optional[float] = Field(None, alias="totalCost", description="总成本（USD）")
     create_time: datetime = Field(..., alias="createTime", description="创建时间")

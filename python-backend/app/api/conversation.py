@@ -1,7 +1,8 @@
 """
 对话接口层
 
-包含 Side-by-Side 多模型并排对比的 SSE 流式接口，以及对话历史查询接口。
+包含 Side-by-Side 多模型并排对比、Prompt Lab 提示词实验、Code Mode 代码模式
+三类 SSE 流式接口，以及对话历史查询接口。
 """
 
 import logging
@@ -14,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.redis import get_async_redis
 from app.db.session import get_async_db
 from app.schemas.conversation import (
+    CodeModePromptLabRequest,
+    CodeModeRequest,
     ConversationMessageVO,
     ConversationQueryRequest,
     GenerateVariantsRequest,
@@ -138,6 +141,87 @@ async def prompt_lab_stream(
     )
 
 
+@router.post("/code-mode/stream", summary="代码模式(流式)")
+async def code_mode_stream(
+    request_data: CodeModeRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """
+    Code Mode 代码模式（SSE 流式响应）
+
+    同一个需求让多个模型并行生成可直接运行的网页代码，前端拿代码块做沙箱预览。
+    """
+    # 限流检查：与 Side-by-Side 同样是「一次请求并发调用多个模型」，按用户维度限流
+    await check_rate_limit(
+        _get_redis(http_request),
+        http_request,
+        RateLimitType.USER,
+        5,
+        60,
+        message="AI 对话请求过于频繁，请稍后再试",
+    )
+    login_user = await UserService.get_login_user(db, http_request)
+
+    conversation_service = ConversationService(db, _get_redis(http_request))
+
+    # 参数 / 安全校验必须放在建流之前：code_mode_stream 是异步生成器，
+    # 里面的 BusinessException 要等到响应体开始推送才抛出，那时 HTTP 头已经发出，
+    # 前端只能拿到一个空流（表现为「连接已中断」），看不到具体原因。
+    conversation_service._validate_code_mode_request(request_data)
+
+    return StreamingResponse(
+        _stream_with_disconnect_check(
+            conversation_service.code_mode_stream(request_data, login_user.id),
+            http_request,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/code-mode/prompt-lab/stream", summary="代码模式提示词实验(流式)")
+async def code_mode_prompt_lab_stream(
+    request_data: CodeModePromptLabRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """
+    Code Mode 提示词实验（SSE 流式响应）
+
+    同一个模型 + 多个提示词变体，对比哪种问法能问出更好的网页代码。
+    """
+    await check_rate_limit(
+        _get_redis(http_request),
+        http_request,
+        RateLimitType.USER,
+        5,
+        60,
+        message="AI 对话请求过于频繁，请稍后再试",
+    )
+    login_user = await UserService.get_login_user(db, http_request)
+
+    conversation_service = ConversationService(db, _get_redis(http_request))
+    conversation_service._validate_code_mode_prompt_lab_request(request_data)
+
+    return StreamingResponse(
+        _stream_with_disconnect_check(
+            conversation_service.code_mode_prompt_lab_stream(request_data, login_user.id),
+            http_request,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post(
     "/prompt-lab/generate-variants",
     response_model=BaseResponse[list[str]],
@@ -184,6 +268,7 @@ async def list_conversation_vo_by_page(
         conversation_type=query_request.conversation_type,
         current=query_request.current,
         page_size=query_request.page_size,
+        code_preview_enabled=query_request.code_preview_enabled,
     )
     return BaseResponse(code=0, data=page_result, message="ok")
 

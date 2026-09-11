@@ -17,10 +17,13 @@
   },
   "dependencies": {
     "@ant-design/icons-vue": "^7.0.1",
+    "@stomp/stompjs": "^7.3.0",
     "ant-design-vue": "^4.2.6",
     "axios": "^1.20.0",
     "marked": "^18.0.12",
+    "monaco-editor": "^0.56.0",
     "pinia": "^4.0.2",
+    "sockjs-client": "^1.6.1",
     "vue": "^3.5.40",
     "vue-router": "^5.2.0"
   },

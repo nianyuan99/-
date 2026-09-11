@@ -1,19 +1,22 @@
 """
 对话服务层
 
-本节核心：多模型并排对比（Side-by-Side）。
-Python 用 asyncio.Queue + asyncio.create_task 实现「多模型同时回答、谁先有数据谁先发」，
-效果等价于 Java 版的 Flux.merge()。
+本节核心：
+1. 多模型并排对比（Side-by-Side）。Python 用 asyncio.Queue + asyncio.create_task 实现
+   「多模型同时回答、谁先有数据谁先发」，效果等价于 Java 版的 Flux.merge()。
+2. 代码模式（Code Mode）。在 Side-by-Side / Prompt Lab 的基础上注入代码生成的系统提示词，
+   并在流式结束后从 Markdown 里提取代码块，落库 + 随 done 事件回传前端做沙箱预览。
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 from decimal import Decimal
-from typing import AsyncGenerator, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants import (
@@ -35,6 +38,8 @@ from app.models.conversation import Conversation
 from app.models.conversation_message import ConversationMessage
 from app.models.model import Model
 from app.schemas.conversation import (
+    CodeModePromptLabRequest,
+    CodeModeRequest,
     ConversationMessageVO,
     ConversationVO,
     GenerateVariantsRequest,
@@ -42,6 +47,7 @@ from app.schemas.conversation import (
     SideBySideRequest,
     StreamChunkVO,
 )
+from app.utils.code_extractor import extract_code_blocks
 from app.utils.cost_calculator import CostCalculator
 from app.utils.prompt_security import validate_prompt
 
@@ -55,6 +61,30 @@ HISTORY_MAX_MESSAGES = 20
 
 # 变体自动生成默认使用的模型（OpenRouter 账号没钱，跑在免费模型上）
 GENERATE_VARIANTS_DEFAULT_MODEL = "nex-agi/nex-n2.5-mini:free"
+
+# 代码模式系统提示词
+#
+# 目的：把「聊天」变成「产出可直接运行的单文件网页」。
+# 关键约束是「HTML/CSS/JS 写在同一个文件里」—— 前端 iframe 用 srcdoc 做沙箱预览，
+# 只有单文件才能直接渲染；多文件的话需要前端再做资源合并（见 CodePreview 的 mergeCodeBlocks）。
+CODE_MODE_SYSTEM_PROMPT = """
+你是一个专业的前端开发专家。用户会向你描述想要创建的网站或应用，你需要生成完整的HTML代码。
+
+代码要求：
+1. 生成完整的HTML网页代码（包含HTML、CSS和JavaScript）
+2. 将HTML、CSS和JavaScript都写在同一个HTML文件中
+3. CSS写在<style>标签内，JavaScript写在<script>标签内
+4. 代码要完整可运行，可以直接在浏览器中打开
+5. 使用现代化的CSS样式，界面要美观、专业
+6. 确保代码有良好的注释
+
+回复格式：
+- 你可以先简要说明设计思路或实现要点
+- 然后使用Markdown代码块输出完整的HTML代码
+- 代码后可以补充使用说明或功能说明
+
+注意：虽然可以添加文字说明，但核心重点是生成可运行的HTML代码。
+"""
 
 # 持有「取消后补写中断内容」的后台任务强引用。
 # asyncio 官方提示：只 create_task 而不保留引用，任务可能被垃圾回收导致写库丢失。
@@ -171,6 +201,216 @@ class ConversationService:
         # ========== 5. 合并所有流并返回 ==========
         async for event in self._merge_streams(tasks, request.models, conversation_id):
             yield event
+
+    # ============ 对外方法：Code Mode 代码模式流式对比 ============
+
+    async def code_mode_stream(
+        self, request: CodeModeRequest, user_id: int
+    ) -> AsyncGenerator[str, None]:
+        """
+        Code Mode 代码模式（SSE 流式响应）
+
+        与 Side-by-Side 的区别只有三点：
+        1. 注入 CODE_MODE_SYSTEM_PROMPT，引导模型输出可运行的单文件 HTML；
+        2. 建对话时 code_preview_enabled=1，前端据此把会话归到「代码模式」；        3. 流式结束后（见 _stream_single_model）提取代码块并随 done 事件回传。
+
+        Args:
+            request: 代码模式请求
+            user_id: 当前登录用户ID
+
+        Yields:
+            SSE 格式的字符串（data: {json}\n\n）
+        """
+        self._validate_code_mode_request(request)
+
+        prompt = request.prompt.strip()
+        conversation_id = request.conversation_id
+
+        # 与 side_by_side_stream 同理：流式开始后主请求的 db session 可能已被回收，
+        # 这里统一使用独立的 AsyncSessionLocal。
+        async with AsyncSessionLocal() as independent_db:
+            if conversation_id:
+                result = await independent_db.execute(
+                    select(Conversation).where(
+                        Conversation.id == conversation_id,
+                        Conversation.user_id == user_id,
+                        Conversation.is_delete == 0,
+                    )
+                )
+                if not result.scalar_one_or_none():
+                    raise BusinessException(ErrorCode.NOT_FOUND_ERROR, "对话不存在")
+            else:
+                conversation_id = str(uuid.uuid4())
+                independent_db.add(
+                    Conversation(
+                        id=conversation_id,
+                        user_id=user_id,
+                        title=self._generate_title(prompt),
+                        conversation_type=CONVERSATION_TYPE_SIDE_BY_SIDE,
+                        models=request.models,
+                        # 标记这是一个代码预览类型的对话，方便前端区分展示方式
+                        code_preview_enabled=1,
+                        total_tokens=0,
+                        total_cost=Decimal("0"),
+                        is_delete=0,
+                    )
+                )
+
+            user_message_index = await self._save_user_message(
+                independent_db, conversation_id, user_id, prompt
+            )
+            await independent_db.commit()
+
+        assistant_message_index = user_message_index + 1
+
+        tasks = [
+            self._stream_single_model(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_name=model_name,
+                prompt=prompt,
+                message_index=assistant_message_index,
+                user_message_index=user_message_index,
+                variant_index=None,
+                image_urls=request.image_urls,
+                web_search_enabled=bool(request.web_search_enabled),
+                # 代码模式与普通对话模式的唯一区别：多了这个系统提示词
+                system_prompt=CODE_MODE_SYSTEM_PROMPT,
+            )
+            for model_name in request.models
+        ]
+
+        async for event in self._merge_streams(tasks, request.models, conversation_id):
+            yield event
+
+    def _validate_code_mode_request(self, request: CodeModeRequest) -> None:
+        """
+        校验代码模式请求参数
+
+        与 Side-by-Side 的校验一致（同样是「一个提示词 + 多个模型」），
+        额外对提示词做安全审查，避免把注入指令直接送给多个模型。
+        """
+        if not request.models:
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "模型列表不能为空")
+        if len(request.models) > SIDE_BY_SIDE_MAX_MODELS:
+            raise BusinessException(
+                ErrorCode.PARAMS_ERROR, f"最多支持{SIDE_BY_SIDE_MAX_MODELS}个模型"
+            )
+
+        prompt = (request.prompt or "").strip()
+        if not prompt:
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "提示词不能为空")
+        validate_prompt(prompt)
+
+    async def code_mode_prompt_lab_stream(
+        self, request: CodeModePromptLabRequest, user_id: int
+    ) -> AsyncGenerator[str, None]:
+        """
+        Code Mode 提示词实验（SSE 流式响应）
+
+        「同一个模型 + 多个提示词变体 + 代码生成」：用于横向比较不同问法
+        能问出多好的网页代码。与 prompt_lab_stream 的差异同样只是注入系统提示词
+        和 code_preview_enabled=1。
+
+        Args:
+            request: 代码模式提示词实验请求
+            user_id: 当前登录用户ID
+
+        Yields:
+            SSE 格式的字符串（data: {json}\n\n）
+        """
+        self._validate_code_mode_prompt_lab_request(request)
+
+        prompt_variants = request.prompt_variants
+        image_urls_list = request.variant_image_urls or []
+
+        conversation_id = request.conversation_id
+        async with AsyncSessionLocal() as independent_db:
+            if conversation_id:
+                result = await independent_db.execute(
+                    select(Conversation).where(
+                        Conversation.id == conversation_id,
+                        Conversation.user_id == user_id,
+                        Conversation.is_delete == 0,
+                    )
+                )
+                if not result.scalar_one_or_none():
+                    raise BusinessException(ErrorCode.NOT_FOUND_ERROR, "对话不存在")
+            else:
+                conversation_id = str(uuid.uuid4())
+                independent_db.add(
+                    Conversation(
+                        id=conversation_id,
+                        user_id=user_id,
+                        title=self._generate_title(prompt_variants[0]),
+                        conversation_type=CONVERSATION_TYPE_PROMPT_LAB,
+                        models=[request.model],
+                        code_preview_enabled=1,
+                        total_tokens=0,
+                        total_cost=Decimal("0"),
+                        is_delete=0,
+                    )
+                )
+
+            user_message_index = await self._get_next_message_index(
+                independent_db, conversation_id
+            )
+            assistant_message_index = user_message_index + 1
+
+            for idx, variant in enumerate(prompt_variants):
+                variant_images = image_urls_list[idx] if idx < len(image_urls_list) else None
+                await self._save_prompt_lab_user_message(
+                    independent_db,
+                    conversation_id,
+                    user_id,
+                    user_message_index,
+                    idx,
+                    variant,
+                    variant_images,
+                )
+
+            await independent_db.commit()
+
+        tasks = [
+            self._stream_single_model(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_name=request.model,
+                prompt=variant,
+                message_index=assistant_message_index,
+                user_message_index=user_message_index,
+                variant_index=idx,
+                image_urls=image_urls_list[idx] if idx < len(image_urls_list) else None,
+                web_search_enabled=bool(request.web_search_enabled),
+                system_prompt=CODE_MODE_SYSTEM_PROMPT,
+            )
+            for idx, variant in enumerate(prompt_variants)
+        ]
+
+        model_names = [request.model] * len(prompt_variants)
+        async for event in self._merge_streams(tasks, model_names, conversation_id):
+            yield event
+
+    def _validate_code_mode_prompt_lab_request(
+        self, request: CodeModePromptLabRequest
+    ) -> None:
+        """校验代码模式的提示词实验请求（变体数量 + 逐个安全审查）"""
+        if not request.model or not request.model.strip():
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "模型不能为空")
+
+        if not request.prompt_variants:
+            raise BusinessException(ErrorCode.PARAMS_ERROR, "提示词变体列表不能为空")
+
+        count = len(request.prompt_variants)
+        if count < MIN_PROMPT_VARIANTS_COUNT or count > MAX_PROMPT_VARIANTS_COUNT:
+            raise BusinessException(
+                ErrorCode.PARAMS_ERROR,
+                f"提示词变体数量必须在{MIN_PROMPT_VARIANTS_COUNT}-"
+                f"{MAX_PROMPT_VARIANTS_COUNT}个之间",
+            )
+
+        for variant in request.prompt_variants:
+            validate_prompt(variant)
 
     # ============ 对外方法：Prompt Lab 流式对比 ============
 
@@ -524,6 +764,19 @@ class ConversationService:
             )
             reasoning = _clean_reasoning(accumulated_reasoning)
 
+            # ---- 代码提取（本节新增的「胶水」逻辑）----
+            # 不管是不是代码模式都提取一次：普通对话里 AI 也可能随手给出代码块，
+            # 提取到就顺带落库，前端 MarkdownRenderer 会自动把它渲染成可预览的卡片。
+            code_blocks_list: List[Dict[str, Any]] = []
+            if accumulated_content and accumulated_content.strip():
+                code_blocks_list = extract_code_blocks(accumulated_content)
+                if code_blocks_list:
+                    logger.info("从响应中提取到 %d 个代码块", len(code_blocks_list))
+
+            code_blocks_json = (
+                json.dumps(code_blocks_list, ensure_ascii=False) if code_blocks_list else None
+            )
+
             async with AsyncSessionLocal() as independent_db:
                 await self._save_assistant_message(
                     independent_db,
@@ -538,6 +791,7 @@ class ConversationService:
                     cost,
                     response_time_ms,
                     reasoning,
+                    code_blocks_json,
                 )
 
             done_vo = StreamChunkVO(
@@ -555,6 +809,9 @@ class ConversationService:
                 reasoning=reasoning,
                 has_reasoning=bool(reasoning),
                 thinking_time=int(time.time() - thinking_start_time) if reasoning and thinking_start_time else None,
+                # 前端收到 done=True 时就能直接拿到解析好的代码块，不用自己再解析 Markdown
+                code_blocks=code_blocks_list if code_blocks_list else None,
+                has_code_blocks=bool(code_blocks_list),
             )
             yield f"data: {done_vo.model_dump_json(by_alias=True, exclude_none=True)}\n\n"
 
@@ -682,9 +939,14 @@ class ConversationService:
         conversation_type: Optional[str] = None,
         current: int = 1,
         page_size: int = 10,
+        code_preview_enabled: Optional[bool] = None,
     ) -> dict:
         """
         分页查询当前用户的对话列表
+
+        Args:
+            code_preview_enabled: 按「是否启用代码预览」筛选；None 表示不筛。
+                代码模式页面传 True 只看代码会话；普通对比页传 False 避免混入代码会话。
 
         Returns:
             包含 records / total / current / pageSize 的分页结果
@@ -694,6 +956,12 @@ class ConversationService:
         )
         if conversation_type:
             query = query.where(Conversation.conversation_type == conversation_type)
+
+        # 新增：按代码预览启用状态筛选
+        if code_preview_enabled is not None:
+            query = query.where(
+                Conversation.code_preview_enabled == (1 if code_preview_enabled else 0)
+            )
 
         count_result = await self.db.execute(select(func.count()).select_from(query.subquery()))
         total = count_result.scalar() or 0
@@ -831,11 +1099,13 @@ class ConversationService:
         cost: Decimal,
         response_time_ms: int,
         reasoning: Optional[str],
+        code_blocks_json: Optional[str] = None,
     ) -> None:
         """
         保存 AI 回复，并累加对话/模型的消耗统计
 
         variant_index 落库供 Prompt Lab 还原变体分组；Side-by-Side 传 None。
+        code_blocks_json 是从回复里提取的代码块 JSON 字符串（没有代码块时传 None）。
         """
         db.add(
             ConversationMessage(
@@ -852,6 +1122,7 @@ class ConversationService:
                 output_tokens=output_tokens,
                 cost=cost,
                 reasoning=reasoning,
+                code_blocks=code_blocks_json,
                 is_delete=0,
             )
         )
@@ -910,6 +1181,14 @@ class ConversationService:
         )
 
         async def persist() -> None:
+            # 中断时也提取一次代码块：用户很可能是在「代码已经生成完、只剩说明文字」
+            # 的时候点的停止，落库时带上代码块，历史记录里才能恢复预览。
+            interrupted_code_blocks = extract_code_blocks(content) if content.strip() else []
+            interrupted_code_json = (
+                json.dumps(interrupted_code_blocks, ensure_ascii=False)
+                if interrupted_code_blocks
+                else None
+            )
             async with AsyncSessionLocal() as independent_db:
                 await self._save_assistant_message(
                     independent_db,
@@ -924,6 +1203,7 @@ class ConversationService:
                     cost,
                     response_time_ms,
                     _clean_reasoning(reasoning),
+                    interrupted_code_json,
                 )
 
         persist_task = asyncio.create_task(persist())

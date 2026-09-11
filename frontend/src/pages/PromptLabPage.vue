@@ -507,14 +507,15 @@ import {
 } from '@/api/conversation'
 import { listModels, type ModelVO } from '@/api/model'
 import { createPostSSE, type SSEHandle } from '@/utils/sseClient'
+import { MODE_OPTIONS, MODE_PROMPT_LAB, resolveModeNavigation } from '@/constants/mode'
 import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
 
 /** 变体数量约束，与后端 constants 保持一致 */
 const MIN_VARIANTS = 2
 const MAX_VARIANTS = 5
 
-/** 页面所在模式：本页固定是 prompt-lab，另外两项会跳去模型对比页 */
-const PROMPT_LAB_MODE = 'prompt-lab'
+/** 页面所在模式：本页固定是 prompt-lab，另外几项会跳去对应页面 */
+const PROMPT_LAB_MODE = MODE_PROMPT_LAB
 
 /** 距离底部多少像素内算「贴着底部」，此时新内容自动跟随滚动 */
 const AUTO_SCROLL_THRESHOLD = 80
@@ -570,11 +571,7 @@ const modelLoading = ref(false)
 const mode = ref<string>(PROMPT_LAB_MODE)
 const selectedModel = ref<string>()
 
-const modeOptions = [
-  { value: 'compare', label: '模型对比' },
-  { value: 'single', label: '单模型' },
-  { value: PROMPT_LAB_MODE, label: '提示词实验' },
-]
+const modeOptions = MODE_OPTIONS
 
 // ---------- 实验状态 ----------
 const variants = ref<string[]>(['', ''])
@@ -792,10 +789,11 @@ onBeforeUnmount(() => {
 
 /* ==================== 模式切换 ==================== */
 
-/** 下拉里选「模型对比 / 单模型」= 回模型对比页；本页固定显示「提示词实验」 */
+/** 下拉里选「模型对比 / 单模型 / 代码模式」= 跳到对应页面；本页固定显示「提示词实验」 */
 const onModeChange = (value: string) => {
   if (value === PROMPT_LAB_MODE) return
-  router.push('/side-by-side')
+  const target = resolveModeNavigation(value, PROMPT_LAB_MODE)
+  if (target) router.push(target)
   mode.value = PROMPT_LAB_MODE
 }
 
@@ -819,12 +817,14 @@ const loadModels = async () => {
   }
 }
 
-/** 加载侧栏历史实验（只取 prompt_lab 类型，避免混入模型对比的会话） */
+/** 加载侧栏历史实验（只取 prompt_lab 类型、且非代码预览会话，避免混入其他模式的记录） */
 const loadConversations = async () => {
   historyLoading.value = true
   try {
     const res = await listConversationVoByPage({
       conversationType: 'prompt_lab',
+      // 代码模式的提示词实验也是 prompt_lab 类型，靠 codePreviewEnabled 区分开
+      codePreviewEnabled: false,
       current: 1,
       pageSize: HISTORY_PAGE_SIZE,
     })
